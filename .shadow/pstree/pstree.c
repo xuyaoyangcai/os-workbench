@@ -8,6 +8,7 @@
 #include <errno.h>
 
 #define MAX_PROCS 32768  // 进程数量最大限制
+#define MAX_PATH_LEN 512  // 增加路径最大长度，避免溢出
 
 typedef struct Process {
     int pid;
@@ -37,9 +38,13 @@ void read_proc_info() {
     while ((entry = readdir(dir))) {
         if (!isdigit(entry->d_name[0])) continue;  // 只处理数字 PID
 
-        char path[256], line[256];
-        // 确保路径不会溢出
-        snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+        char path[MAX_PATH_LEN], line[256];
+        // 使用 snprintf 确保路径不会溢出
+        int ret = snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+        if (ret < 0 || ret >= sizeof(path)) {
+            fprintf(stderr, "Error: Path too long for %s\n", entry->d_name);
+            continue;  // 跳过该进程
+        }
 
         FILE* file = fopen(path, "r");
         if (!file) continue;
