@@ -22,9 +22,9 @@ typedef struct Process {
 Process* create_process(pid_t pid, pid_t ppid, const char* name);
 void add_child(Process* parent, Process* child);
 void free_process_tree(Process* root);
-void print_process_tree(Process* root, int indent_level, int show_pids);
+void print_process_tree(Process* root, int show_pids);
 Process* get_process_info(pid_t pid);
-int parse_pid_file(const char* file_path, pid_t* pid);
+int parse_pid_file(const char* file_path, pid_t* ppid);
 int parse_name_file(const char* file_path, char* name);
 
 // 获取进程信息
@@ -95,25 +95,30 @@ int parse_name_file(const char* file_path, char* name) {
 }
 
 // 打印进程树
-void print_process_tree(Process* root, int indent_level, int show_pids) {
+void print_process_tree(Process* root, int show_pids) {
     if (!root) return;
 
-    // 打印缩进
-    for (int i = 0; i < indent_level; i++) {
-        printf("  ");
-    }
+    // 使用栈避免递归
+    Process* stack[32768];
+    int stack_top = -1;
+    stack[++stack_top] = root;
 
-    printf("%s", root->name);
-    if (show_pids) {
-        printf(" (%d)", root->pid);
-    }
-    printf("\n");
+    while (stack_top >= 0) {
+        Process* curr = stack[stack_top--];
 
-    // 打印子进程
-    Process* child = root->children;
-    while (child != NULL) {
-        print_process_tree(child, indent_level + 1, show_pids);
-        child = child->next;
+        // 打印当前进程
+        printf("%s", curr->name);
+        if (show_pids) {
+            printf(" (%d)", curr->pid);
+        }
+        printf("\n");
+
+        // 将子进程压入栈
+        Process* child = curr->children;
+        while (child != NULL) {
+            stack[++stack_top] = child;
+            child = child->next;
+        }
     }
 }
 
@@ -192,7 +197,7 @@ int main(int argc, char* argv[]) {
 
     // 假设进程 ID 1 是 root 进程
     if (processes[1]) {
-        print_process_tree(processes[1], 0, show_pids);
+        print_process_tree(processes[1], show_pids);
     }
 
     // 释放内存
@@ -202,4 +207,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
