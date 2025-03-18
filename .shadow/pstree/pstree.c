@@ -37,8 +37,8 @@ void read_proc_info() {
     while ((entry = readdir(dir))) {
         if (!isdigit(entry->d_name[0])) continue;  // 只处理数字 PID
 
-        char path[256], line[256];
-        snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+        char path[512], line[256];  // 扩大路径缓冲区的大小
+        snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);  // 更长的路径
         FILE* file = fopen(path, "r");
         if (!file) continue;
 
