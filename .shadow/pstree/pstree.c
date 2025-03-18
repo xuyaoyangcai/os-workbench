@@ -5,10 +5,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <stdlib.h>
-#include <assert.h>
 
-
-struct data{
+struct data {
     char name[100];
     int pid;
     int ppid;
@@ -17,7 +15,7 @@ struct data{
     char ppidstring[100];
 };
 
-struct Node{
+struct Node {
     struct data item;
     struct Node* parent;
     struct Node* child;
@@ -26,52 +24,22 @@ struct Node{
 };
 
 void print(struct Node* node, bool show_pid) {
-    if (show_pid == false) {
-        if (node == NULL) {
-            return ;
-        }
-        if (node->child == NULL) {
-            for (int i = 0; i < node->layer; i++) {
-                printf("\t");
-            }
-            printf("%s", node->item.name);
-            print(node->brother, show_pid);
-            return;
-        }
-        for (int i = 0; i < node->layer; i++)
-            printf("\t");
-        printf("%s", node->item.name);
-        print(node->child, show_pid);
-        print(node->brother, show_pid);
-    } else {
-        if (node == NULL) {
-            return ;
-        }
-        for (int i = 0; node->item.name[i] !='\0'; i++) {
-            if (node->item.name[i] == '\n') {
-                node->item.name[i] = '\0';
-            }
-        }
-        char left_bracket[] = "(";
-        char right_bracket[] = ")\n";
-        strcat(strcat(strcat(node->item.name, left_bracket), node->item.pidstring), right_bracket);
-        if (node->child == NULL) {
-            for (int i = 0; i < node->layer; i++) {
-                printf("\t");
-            }
-
-            printf("%s", node->item.name);
-            print(node->brother, show_pid);
-            return;
-        }
-        for (int i = 0; i < node->layer; i++)
-            printf("\t");
-        printf("%s", node->item.name);
-        print(node->child, show_pid);
-        print(node->brother, show_pid);
-
+    if (node == NULL) {
+        return;
     }
+    for (int i = 0; i < node->layer; i++) {
+        printf("\t");
+    }
+    if (show_pid) {
+        printf("(%d) %s", node->item.pid, node->item.name);
+    } else {
+        printf("%s", node->item.name);
+    }
+    printf("\n");
+    print(node->child, show_pid);  // 先打印子节点
+    print(node->brother, show_pid); // 再打印兄弟节点
 }
+
 void swap_data(struct data* pd1, struct data* pd2) {
     struct data tmp;
     struct data* ptmp = &tmp;
@@ -108,42 +76,28 @@ int compute_layer(struct data* a, struct data* list) {
     if (a->ppid == 0) {
         a->layer = 0;
         return a->layer;
-    }
-
-    else
-    {
+    } else {
         struct data* pdata;
         for (pdata = list; pdata->pid != a->ppid; pdata++);
         assert(pdata->pid == a->ppid);
         a->layer = compute_layer(pdata, list) + 1;
         return a->layer;
     }
-
-}
-
-void showdir(char* path_of_dir) {
-    DIR* dir;
-    struct dirent *ptr;
-    dir = opendir(path_of_dir);
-    while((ptr = readdir(dir)) != NULL) {
-        printf("%s is in the directory %s.\n", ptr->d_name, path_of_dir);
-    }
 }
 
 int my_filter(const struct dirent* dir) {
-    if ((dir->d_name)[0] >= '0' && (dir->d_name)[0]<='9')
+    if ((dir->d_name)[0] >= '0' && (dir->d_name)[0] <= '9')
         return 1;
     else
         return 0;
 }
 
-
-
 int main(int argc, char *argv[]) {
     typedef bool pstree_option;
     pstree_option pstree_show_pids, pstree_numeric_sort, pstree_version;
     pstree_show_pids = pstree_numeric_sort = pstree_version = false;
-    for (int i  = 0; i < argc; i++) {
+
+    for (int i = 0; i < argc; i++) {
         assert(argv[i]);
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--show-pids") == 0)
             pstree_show_pids = true;
@@ -158,7 +112,6 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-
     struct dirent **namelist;
     int n;
     n = scandir("/proc", &namelist, my_filter, alphasort);
@@ -166,16 +119,16 @@ int main(int argc, char *argv[]) {
     char current_path[100];
     char one_line[100];
     struct data list[nn];
+
     for (int i = 0; i < nn; i++) {
-        strcat(strcat(strcpy(current_path,"/proc/"), namelist[i]->d_name), "/status");
+        strcat(strcat(strcpy(current_path, "/proc/"), namelist[i]->d_name), "/status");
         FILE* fp = fopen(current_path, "r");
         fgets(one_line, 100, fp);
         strcpy(list[i].name, one_line + 6);
-        while(strncmp(one_line, "Pid:", 4) != 0) {
+        while (strncmp(one_line, "Pid:", 4) != 0) {
             fgets(one_line, 100, fp);
         } // get pid
         strcpy(list[i].pidstring, one_line + 5);
-        // list[i].pidstring[strlen(one_line)-2] = '\0'
         for (int j = 0; list[i].pidstring[j] != '\0'; j++) {
             if (list[i].pidstring[j] == '\n') {
                 list[i].pidstring[j] = '\0';
@@ -187,17 +140,9 @@ int main(int argc, char *argv[]) {
         } // get ppid
         list[i].ppid = atoi(one_line + 6);
         list[i].layer = -1;
-        // if (strncmp(list[i].name, "xfce4-terminal", strlen("xfce4-terminal")) == 0 && list[i].pid ==1319) {
-        //     printf("\n\n$%sAWESOME!!!!\ni:%dpid:%d ppid:%dpidstring:%s\nppidstring:%s&\n\n", list[i].name, i, list[i].pid, list[i].ppid,list[i].pidstring, list[i].ppidstring);
-
-        // } // assert(0);
-        // if (strncmp(list[i].name, "bash", 4) == 0)
-        //     printf("list[%d].name is %slist[i].pid is %d\nlist[i].ppid is %d\n\n", i, list[i].name, list[i].pid, list[i].ppid);
-        // if (strncmp(list[i].name, "bash", strlen("bash")) == 0 && list[i].pid ==1319) {
-        //     printf("\n\n@%sAWESOME!!!!i:%dpid:%d ppid:%dpidstring:%s#ppidstring:%s\n\n", list[i].name, i, list[i].pid, list[i].ppid, list[i].pidstring, list[i].ppidstring);
-        //     assert(0);
-        // }
+        fclose(fp);
     }
+
     for (int i = 0; i < nn; i++) {
         list[i].layer = compute_layer(&list[i], list);
     }
@@ -206,103 +151,60 @@ int main(int argc, char *argv[]) {
         struct data tmp;
         for (int i = 0; i < nn - 1; i++) {
             for (int j = 0; j < nn - 1 - i; j++) {
-                if (list[j].layer > list[j + 1].layer || (list[j].layer == list[j + 1].layer && strcmp(list[j].name, list[j + 1].name) > 0) ) {
+                if (list[j].layer > list[j + 1].layer) {
                     swap_data(&list[j], &list[j + 1]);
-                }
-            }
-        }
-
-        struct Node Nodelist[nn];
-        memset(&Nodelist, 0, nn*sizeof(struct Node));
-        for (int i = 0; i < nn; i++) {
-            copy_data(&Nodelist[i].item, &list[i]);
-            Nodelist[i].layer = Nodelist[i].item.layer;
-            if (Nodelist[i].item.ppid == 0) {
-                Nodelist[i].parent = NULL;
-                Nodelist[i].brother = NULL;
-            }
-        }
-
-        for (int i = 0; i < nn; i++) {
-            if (Nodelist[i].item.ppid == 0)
-                continue;
-            else {
-                for (int j = 0; j < nn; j++) {
-                    if (Nodelist[j].item.pid == Nodelist[i].item.ppid) {
-                        Nodelist[i].parent = &Nodelist[j];
-                        if (Nodelist[j].child == NULL) {
-                            Nodelist[j].child = &Nodelist[i];
-                        } else {
-                            struct Node* ptrNode;
-                            ptrNode = Nodelist[j].child;
-                            while (ptrNode->brother != NULL) {
-                                ptrNode = ptrNode->brother;
-                            }
-                            ptrNode->brother = &Nodelist[i];
+                } else if (list[j].layer == list[j + 1].layer) {
+                    if (list[j].ppid > list[j + 1].ppid) {
+                        swap_data(&list[j], &list[j + 1]);
+                    } else if (list[j].ppid == list[j + 1].ppid) {
+                        if (list[j].pid > list[j + 1].pid) {
+                            swap_data(&list[j], &list[j + 1]);
                         }
                     }
                 }
             }
         }
-
-
-        // for (int i = 0; i < nn; i++) {
-        //     printf("layer:%d\t(pid%d)(ppid%d)%s",list[i].layer, list[i].pid, list[i].ppid, list[i].name);
-        // }
-        int start = 0;
-        for (int i = 0; i < nn; i++) {
-            if (Nodelist[i].item.pid == 1)
-                start = i;
-        }
-        print(&Nodelist[start], pstree_show_pids);
-        return 0;
     }
-    if (pstree_numeric_sort == true) {
 
-        struct data tmp;
-        for (int i = 0; i < nn - 1; i++) {
-            for (int j = 0; j < nn - 1 - i; j++) {
-                if (list[j].layer > list[j + 1].layer || (list[j].layer == list[j+1].layer && list[j].pid > list[j+1].pid)) {
-                    swap_data(&list[j], &list[j + 1]);
-                }
-            }
+    struct Node Nodelist[nn];
+    memset(&Nodelist, 0, nn * sizeof(struct Node));
+    for (int i = 0; i < nn; i++) {
+        copy_data(&Nodelist[i].item, &list[i]);
+        Nodelist[i].layer = Nodelist[i].item.layer;
+        if (Nodelist[i].item.ppid == 0) {
+            Nodelist[i].parent = NULL;
+            Nodelist[i].brother = NULL;
         }
-        struct Node Nodelist[nn];
-        memset(&Nodelist, 0, nn*sizeof(struct Node));
-        for (int i = 0; i < nn; i++) {
-            copy_data(&Nodelist[i].item, &list[i]);
-            Nodelist[i].layer = Nodelist[i].item.layer;
-            if (Nodelist[i].item.ppid == 0) {
-                Nodelist[i].parent = NULL;
-                Nodelist[i].brother = NULL;
-            }
-        }
+    }
 
-        for (int i = 0; i < nn; i++) {
-            if (Nodelist[i].item.ppid == 0)
-                continue;
-            else {
-                for (int j = 0; j < nn; j++) {
-                    if (Nodelist[j].item.pid == Nodelist[i].item.ppid) {
-                        Nodelist[i].parent = &Nodelist[j];
-                        if (Nodelist[j].child == NULL) {
-                            Nodelist[j].child = &Nodelist[i];
-                        } else {
-                            struct Node* ptrNode;
-                            ptrNode = Nodelist[j].child;
-                            while (ptrNode->brother != NULL) {
-                                ptrNode = ptrNode->brother;
-                            }
-                            ptrNode->brother = &Nodelist[i];
+    for (int i = 0; i < nn; i++) {
+        if (Nodelist[i].item.ppid == 0)
+            continue;
+        else {
+            for (int j = 0; j < nn; j++) {
+                if (Nodelist[j].item.pid == Nodelist[i].item.ppid) {
+                    Nodelist[i].parent = &Nodelist[j];
+                    if (Nodelist[j].child == NULL) {
+                        Nodelist[j].child = &Nodelist[i];
+                    } else {
+                        struct Node* ptrNode = Nodelist[j].child;
+                        while (ptrNode->brother != NULL) {
+                            ptrNode = ptrNode->brother;
                         }
+                        ptrNode->brother = &Nodelist[i];
                     }
+                    break;
                 }
             }
         }
-
-        print(&Nodelist[0], pstree_show_pids);
-
     }
-    assert(!argv[argc]);
+
+    int start = 0;
+    for (int i = 0; i < nn; i++) {
+        if (Nodelist[i].item.pid == 1)
+            start = i;
+    }
+    print(&Nodelist[start], pstree_show_pids);
+
     return 0;
 }
