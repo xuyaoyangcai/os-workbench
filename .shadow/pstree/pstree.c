@@ -102,7 +102,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (version_flag) {
-        printf("pstree version 1.0\n");
+        printf("pstree\n");
         exit(EXIT_SUCCESS);
     }
 
