@@ -25,14 +25,7 @@ Process processes[MAX_PROCS];
 int proc_count = 0;
 int show_pids = 0, numeric_sort = 0, version_flag = 0;
 
-// 比较函数，用于按 pid 排序
-int compare_pid(const void *a, const void *b) {
-    Process *procA = (Process *)a;
-    Process *procB = (Process *)b;
-    return procA->pid - procB->pid;
-}
-
-// 读取 /proc 目录获取所有进程信息并排序
+// 读取 /proc 目录获取所有进程信息
 void read_proc_info() {
     DIR* dir = opendir("/proc");
     if (!dir) {
@@ -45,7 +38,9 @@ void read_proc_info() {
         if (!isdigit(entry->d_name[0])) continue;  // 只处理数字 PID
 
         char path[256], line[256];
+        // 确保路径不会溢出
         snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+
         FILE* file = fopen(path, "r");
         if (!file) continue;
 
@@ -64,11 +59,6 @@ void read_proc_info() {
         processes[proc_count++] = proc;
     }
     closedir(dir);
-
-    // 排序进程数组，按 PID 排序
-    if (numeric_sort) {
-        qsort(processes, proc_count, sizeof(Process), compare_pid);
-    }
 }
 
 // 递归打印进程树
@@ -108,7 +98,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (version_flag) {
-        printf("pstree\n");
+        printf("pstree version 1.0\n");
         exit(EXIT_SUCCESS);
     }
 
@@ -118,4 +108,3 @@ int main(int argc, char* argv[]) {
     print_tree(1, 0);
     return 0;
 }
-
