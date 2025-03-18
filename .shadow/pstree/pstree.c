@@ -1,16 +1,15 @@
 #include <stdio.h>
-#include <assert.h>
+#include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <stdlib.h>
 
 #define MAX_PROCESSES 10000
-#define MAX_NAME_LENGTH 50
-#define MAX_CHILDREN 500
+#define MAX_NAME_LEN 50
 
-typedef struct {
-    char name[MAX_NAME_LENGTH];
+typedef struct pidinfo {
+    char name[MAX_NAME_LEN];
     pid_t pid;
     pid_t ppid;
 } PidInfo;
@@ -18,75 +17,128 @@ typedef struct {
 PidInfo pidinfos[MAX_PROCESSES];
 int pid_count = 0;
 
-void read_process_info() {
+char* get_option(int argc, char *argv[]) {
+    if (argc < 2) return NULL;
+    return argv[1] + 1;
+}
+
+pid_t get_process_info(pid_t pid, char name[]) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    pid_t _pid, ppid;
+    char pname[MAX_NAME_LEN];
+    char status;
+    fscanf(fp, "%d (%49[^)]) %c %d", &_pid, pname, &status, &ppid);
+
+    fclose(fp);
+    strncpy(name, pname, MAX_NAME_LEN);
+    return ppid;
+}
+
+void load_process_info() {
     DIR *dp = opendir("/proc");
     if (!dp) {
-        perror("Cannot open /proc");
+        perror("Failed to open /proc");
         exit(EXIT_FAILURE);
     }
+
     struct dirent *entry;
     while ((entry = readdir(dp)) != NULL) {
         int pid = atoi(entry->d_name);
-        if (pid == 0) continue;
-        char path[40];
-        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-        FILE *fp = fopen(path, "r");
-        if (!fp) continue;
-        fscanf(fp, "%d (%49[^)]) %*c %d", &pidinfos[pid_count].pid, pidinfos[pid_count].name, &pidinfos[pid_count].ppid);
-        fclose(fp);
-        pid_count++;
+        if (pid > 0) {
+            pidinfos[pid_count].pid = pid;
+            pidinfos[pid_count].ppid = get_process_info(pid, pidinfos[pid_count].name);
+            pid_count++;
+        }
     }
     closedir(dp);
 }
 
-void find_children(pid_t pid, int index[MAX_CHILDREN]) {
-    int count = 0;
+typedef struct ProcessTree {
+    pid_t pid;
+    char name[MAX_NAME_LEN];
+    struct ProcessTree *children[MAX_PROCESSES];
+    int child_count;
+} ProcessTree;
+
+void find_children(pid_t pid, int indexes[], int *count) {
+    *count = 0;
     for (int i = 0; i < pid_count; i++) {
         if (pidinfos[i].ppid == pid) {
-            index[count++] = i;
+            indexes[(*count)++] = i;
         }
     }
-    index[count] = -1;
 }
 
-void print_tree(pid_t pid, int indent, int show_pid) {
-    for (int i = 0; i < indent; i++) printf("  ");
-    for (int i = 0; i < pid_count; i++) {
-        if (pidinfos[i].pid == pid) {
-            printf("%s%s", pidinfos[i].name, show_pid ? " (%d)" : "", pid);
-            break;
-        }
+void build_tree(ProcessTree *node) {
+    int indexes[MAX_PROCESSES], count;
+    find_children(node->pid, indexes, &count);
+    node->child_count = count;
+
+    for (int i = 0; i < count; i++) {
+        node->children[i] = (ProcessTree *)malloc(sizeof(ProcessTree));
+        node->children[i]->pid = pidinfos[indexes[i]].pid;
+        strcpy(node->children[i]->name, pidinfos[indexes[i]].name);
+        node->children[i]->child_count = 0;
+        build_tree(node->children[i]);
+    }
+}
+
+void print_tree(ProcessTree *node, int depth, int show_pid) {
+    for (int i = 0; i < depth; i++) {
+        printf("  ");
+    }
+    printf("%s", node->name);
+    if (show_pid) {
+        printf("(%d)", node->pid);
     }
     printf("\n");
-    int children[MAX_CHILDREN];
-    find_children(pid, children);
-    for (int i = 0; children[i] != -1; i++) {
-        print_tree(pidinfos[children[i]].pid, indent + 1, show_pid);
+
+    for (int i = 0; i < node->child_count; i++) {
+        print_tree(node->children[i], depth + 1, show_pid);
     }
 }
 
-void print_version() {
-    printf("pstree (PSmisc) UNKNOWN\n");
-    printf("Copyright (C) 1993-2019 Werner Almesberger and Craig Small\n");
-    printf("PSmisc comes with ABSOLUTELY NO WARRANTY.\n");
-    printf("This is free software, and you are welcome to redistribute it under\n");
-    printf("the terms of the GNU General Public License.\n");
+void free_tree(ProcessTree *node) {
+    for (int i = 0; i < node->child_count; i++) {
+        free_tree(node->children[i]);
+        free(node->children[i]);
+    }
 }
 
 int main(int argc, char *argv[]) {
-    read_process_info();
-    int show_pid = 0;
-    if (argc > 1) {
-        if (strcmp(argv[1], "-p") == 0) {
-            show_pid = 1;
-        } else if (strcmp(argv[1], "-V") == 0) {
-            print_version();
-            return 0;
-        } else {
-            fprintf(stderr, "Invalid option\n");
-            return EXIT_FAILURE;
-        }
+    char *option = get_option(argc, argv);
+    load_process_info();
+
+    ProcessTree *root = (ProcessTree *)malloc(sizeof(ProcessTree));
+    root->pid = pidinfos[0].pid;
+    strcpy(root->name, pidinfos[0].name);
+    root->child_count = 0;
+
+    build_tree(root);
+
+    if (!option) {
+        print_tree(root, 0, 0);
+    } else if (strcmp(option, "p") == 0) {
+        print_tree(root, 0, 1);
+    } else if (strcmp(option, "n") == 0) {
+        print_tree(root, 0, 0);
+    } else if (strcmp(option, "V") == 0) {
+        printf("pstree (PSmisc) UNKNOWN\n");
+        printf("Copyright (C) 1993-2019 Werner Almesberger and Craig Small\n");
+        printf("PSmisc comes with ABSOLUTELY NO WARRANTY.\n");
+        printf("This is free software, and you are welcome to redistribute it under\n");
+        printf("the terms of the GNU General Public License.\n");
+    } else {
+        fprintf(stderr, "Invalid option\n");
+        return EXIT_FAILURE;
     }
-    print_tree(1, 0, show_pid); // 假设 1 号进程是根进程
-    return 0;
+
+    free_tree(root);
+    free(root);
+    return EXIT_SUCCESS;
 }
