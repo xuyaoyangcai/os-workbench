@@ -1,149 +1,193 @@
 #include <stdio.h>
-#include <string.h>
 #include <assert.h>
 #include <getopt.h>
+#include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <limits.h>
 #include <dirent.h>
 #include <stdbool.h>
 
-#define MAXPID_T 100000
+#define MAXBUF 128
+#define MAXPID 1024
 
-struct proc_node {
-    pid_t pid;
-    pid_t ppid;
-    char filename[20];
-};
+typedef struct proc {
+    int pid;             // Process ID
+    int ppid;            // Parent process ID
+    char name[16];       // Process name
+} proc;
 
-void printPsTree(struct proc_node *procs, pid_t pid, int level, int ops);
-int listProc(struct proc_node *procs);
-bool isNum(char *s);
+// helper functions
+int process(proc *, int);
+int lsproc(proc *);
+int pstree(proc *, int, int, char *);
+int cmpfunc(const void *, const void *);
+
+enum order {bypid, byname};
+enum order treeOrder = byname; // default processes sorted by name in increasing order
+bool showpid = false;
 
 int main(int argc, char *argv[]) {
-    int ops = 0;
-    static struct option long_options[] = {
-            {"show-pids",       no_argument,    NULL,  'p'},
-            {"numeric-sort",    no_argument,    NULL,  'n'},
-            {"version",         no_argument,    NULL,  'V'},
-            {NULL,              0,              NULL,   0}
-    };
-    char opt;
-    struct proc_node procs[MAXPID_T];
-    for (int i = 0; i < argc; i++) {
-        assert(argv[i]);
-        printf("argv[%d] = %s\n", i, argv[i]);
+    proc *pids = (proc *)malloc(MAXPID * sizeof(proc));
+    int nproc = 0;
+    if ((nproc = lsproc(pids)) <= 0) {
+        return -1; // read procfs failed
     }
-    assert(!argv[argc]);
-    while(-1 != (opt = getopt_long(argc, argv, "pnV", long_options, NULL))){
-        switch(opt) {
+
+    // pasrse opts, switch case
+    int opt;
+    static struct option long_options[] = {{"show-pids", no_argument, 0, 'p'},
+                                           {"numeric-sort", no_argument, 0, 'n'},
+                                           {"version", no_argument, 0, 'V'},
+                                           {0, 0, 0, 0}};
+
+    while ((opt = getopt_long(argc, argv, "pnV", long_options, NULL)) != -1) {
+        // -p or --show-pids
+        // -n or --numeric-sort
+        // -V or --version
+        switch (opt) {
             case 'p':
-                ops = ops | 0x1;
+                printf("show pids\n");
+                // assume all pids in array are sorted by increased order
+                showpid = true;
                 break;
             case 'n':
-                ops = ops | 0x2;
+                printf("numeric sort pids\n");
+                treeOrder = bypid;
                 break;
             case 'V':
-                ops = ops | 0x4;
+                fprintf(stderr, "pstree 0.01\nCopyright (C) 2024 Matrix\n");
                 break;
-            default:
-                printf("wrong argument\n");
+            default: /* '?' */
+                fprintf(stderr, "Usage: %s [-p] [-n] [-V]\n", argv[0]);
                 break;
         }
     }
-    if (listProc(procs) == 0) {
-        switch (ops) {
-            case 0:
-                printf("%s\n", procs[1].filename);
-                printPsTree(procs, 1, 1, ops);
-                break;
-            case 2:
-                printf("%s\n", procs[1].filename);
-                printPsTree(procs, 1, 1, ops);
-                break;
-            case 4:
-            case 6:
-                printf("pstree (PSmisc) UNKNOWN\nCopyright (C) 1993-2019 Werner Almesberger and Craig Small\n\nPSmisc comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under\nthe terms of the GNU General Public License.\nFor more information about these matters, see the files named COPYING.\n");
-                if (ops == 6) {
-                    printf("%s\n", procs[1].filename);
-                    printPsTree(procs, 1, 1, ops);
-                }
-                break;
-            case 1:
-            case 3:
-            case 5:
-            case 7:
-                if (ops >= 5) {
-                    printf("pstree (PSmisc) UNKNOWN\nCopyright (C) 1993-2019 Werner Almesberger and Craig Small\n\nPSmisc comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under\nthe terms of the GNU General Public License.\nFor more information about these matters, see the files named COPYING.\n");
-                }
-                printf("%s(%d)\n", procs[1].filename, 1);
-                printPsTree(procs, 1, 1, ops);
-                break;
-            default:
-                break;
+
+    proc *root = (proc *)malloc(sizeof(proc));
+    if (process(root, 1) > -1) {
+        if (showpid) {
+            printf("%s[%d]\n", root->name, root->pid);
+        } else {
+            printf("%s\n", root->name);
         }
-    } else {
-        exit(1);
     }
+    free(root);
+
+    pstree(pids, nproc, 1, "");
+    free(pids);
     return 0;
 }
 
-void printPsTree(struct proc_node *procs, pid_t pid, int level, int ops) {
-    for (int i = pid; i < MAXPID_T; i++) {
-        if (procs[i].ppid == pid) {
-            for (int j = 0; j < level; j++) {
-                printf("\t");
-            }
-            if (ops & 0x1) {
-                printf("%s(%d)\n", procs[i].filename, i);
+// constructor of proc
+int process(proc *p, int pid) {
+    if (pid == 0) {
+        return -1;
+    }
+    char procname[32];
+    snprintf(procname, sizeof(procname), "/proc/%u/status", pid);
+    FILE *fp = fopen(procname, "r");
+    assert(fp);
+    char status[MAXBUF];
+    if (fp && fread(status, sizeof(char), MAXBUF - 1, fp)) {
+        char *ppid_ptr = strstr(status, "PPid:");
+        char *pname_ptr = strstr(status, "Name:");
+
+        // find success: not returen 0 or EOF(-1, not found)
+        if (sscanf(ppid_ptr, "PPid:%d", &p->ppid) > 0 &&
+            sscanf(pname_ptr, "Name:%s", p->name) > 0) {
+            // printf("DEBUG: pid: %d, name: %s, ppid: %d\n", pid, p->name, p->ppid);
+            p->pid = pid;
+            return 0;
+        }
+    }
+    fclose(fp);
+
+    return -1;
+}
+
+// list all processes folder (aka, all pids)
+int lsproc(proc *procs) {
+    struct dirent *pDirent;
+    DIR *pDir;
+    int pid;
+    int nproc = 0;
+
+    pDir = opendir("/proc");
+    if (pDir == NULL) {
+        printf("Cannot open directory '/proc'\n");
+        return 0;
+    }
+
+    while ((pDirent = readdir(pDir)) != NULL) {
+        // folder is named by number (pid)
+        if (sscanf(pDirent->d_name, "%d", &pid) > 0) {
+            // printf("PID: %d\n", pid);
+            assert(nproc < MAXPID);
+            if (process(procs + nproc, pid) != -1) {
+                nproc += 1;
             } else {
-                printf("%s\n", procs[i].filename);
+                return -1;
             }
-            printPsTree(procs, i, level + 1, ops);
         }
     }
-    return;
+    closedir(pDir);
+
+    return nproc;
 }
 
-int listProc(struct proc_node *procs) {
-    DIR *d;
-    struct dirent *dir;
-    d = opendir("/proc/");
-    if (d) {
-        while ((dir = readdir(d)) != NULL) {
-            if (isNum(dir->d_name)) {
-                char filename[300];
-                int pid, ppid;
-                char exe[256];
-                snprintf(filename, sizeof(filename), "/proc/%s/stat", dir->d_name);
-                FILE *fp = fopen(filename, "r");
-                if (fp) {
-                    fscanf(fp, "%d %s %*c %d", &pid, exe, &ppid);
-                    exe[0] = '{';
-                    exe[strlen(exe)-1] = '}';
-                    procs[pid].pid = pid;
-                    procs[pid].ppid = ppid;
-                    strcpy(procs[pid].filename, exe);
-                    fclose(fp);
-                } else {
-                    return 1;
-                }
-            }
+int pstree(proc *procs, int npid, int pid, char *prefix) {
+    char *pointer, *segment;
+    proc *child = NULL;
+    proc *childs = (proc *) malloc(npid * sizeof(proc));
+    int nchild = 0;
+
+    for (int i = 0; i < npid; i++) {
+        child = procs + i;
+        if (child->ppid == pid) {
+            childs[nchild] = *child; // DONE: can struct assign values directly??? YES!!!
+            nchild += 1;
         }
-        closedir(d);
     }
+
+    if (treeOrder == byname) {
+        // pstree sorted by name then by pid
+        qsort(childs, nchild, sizeof(proc), cmpfunc);
+    } else {
+        // PASS: pstree sorted by pid by default
+        ;
+    }
+
+    // pstree sorted by pid
+    for (int i = 0; i < nchild; i++) {
+        if (i == nchild - 1) {
+            pointer = "└── ";
+            segment = "    ";
+        } else {
+            pointer = "├── ";
+            segment = "│   ";
+        }
+
+        // pre-order traverse process tree
+        if (showpid) {
+            printf("%s%s%s[%d]\n", prefix, pointer, childs[i].name, childs[i].pid);
+        } else {
+            printf("%s%s%s\n", prefix, pointer, childs[i].name);
+        }
+
+        char *next_prefix = (char *)malloc(strlen(prefix) + strlen(segment) + 1);
+        sprintf(next_prefix, "%s%s", prefix, segment);
+        pstree(procs, npid, childs[i].pid, next_prefix);
+        free(next_prefix);
+    }
+
+    free(childs);
+
     return 0;
 }
 
-bool isNum(char *s) {
-    if (s == NULL) {
-        return false;
+int cmpfunc(const void * a, const void * b) {
+    if (strcmp(((proc *)a)->name, ((proc *)b)->name) != 0) {
+        return strcmp(((proc *)a)->name, ((proc *)b)->name) > 0;
+    } else {
+        return ((proc *)a)->pid - ((proc *)b)->pid;
     }
-    for (int i = 0; i < strlen(s); i++) {
-        if (!(s[i] >= '0' && s[i] <= '9')) {
-            return false;
-        }
-    }
-    return true;
 }
