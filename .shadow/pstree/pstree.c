@@ -1,50 +1,119 @@
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <ctype.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <errno.h>
 
-// 功能：列出指定目录中的文件和子目录
-void list_directory(const char *path) {
-    DIR *dir = opendir(path);  // 打开目录
-    struct dirent *entry;  // 用于读取目录项
+#define MAX_PROCS 32768  // 进程数量最大限制
+#define MAX_PATH_LEN 512  // 增加路径最大长度，避免溢出
 
-    if (dir == NULL) {  // 检查是否成功打开目录
+typedef struct Process {
+    int pid;
+    int ppid;
+    char name[256];
+} Process;
+
+Process processes[MAX_PROCS];
+int proc_count = 0;
+int show_pids = 0, numeric_sort = 0, version_flag = 0;
+
+// 读取 /proc 目录获取所有进程信息
+void read_proc_info() {
+    DIR* dir = opendir("/proc");
+    if (!dir) {
         perror("opendir");
-        return;
+        exit(EXIT_FAILURE);
     }
 
-    // 遍历目录中的每一项
-    while ((entry = readdir(dir)) != NULL) {
-        struct stat statbuf;  // 用于存储文件的状态信息
-        char fullpath[1024];  // 用于存储文件的完整路径
+    struct dirent* entry;
+    while ((entry = readdir(dir))) {
+        if (!isdigit(entry->d_name[0])) continue;  // 只处理数字 PID
 
-        // 构造文件的完整路径
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
+        char path[MAX_PATH_LEN], line[256];
+        // 使用 snprintf 确保路径不会溢出
+        int ret = snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
+        if (ret < 0 || ret >= sizeof(path)) {
+            fprintf(stderr, "Error: Path too long for %s\n", entry->d_name);
+            continue;  // 跳过该进程
+        }
 
-        // 使用 stat() 获取文件的状态信息
-        if (stat(fullpath, &statbuf) == 0) {
-            // 判断文件类型是否为目录
-            if (S_ISDIR(statbuf.st_mode)) {
-                // 判断是否为当前目录（.）或上级目录（..），避免递归遍历
-                if (entry->d_name[0] != '.') {
-                    printf("%s (directory)\n", entry->d_name);
-                }
-            } else {
-                printf("%s (file)\n", entry->d_name);
+        FILE* file = fopen(path, "r");
+        if (!file) continue;
+
+        Process proc = {0};
+        proc.pid = atoi(entry->d_name);
+
+        while (fgets(line, sizeof(line), file)) {
+            if (strncmp(line, "Name:", 5) == 0) {
+                sscanf(line, "Name: %255s", proc.name);
+            } else if (strncmp(line, "PPid:", 5) == 0) {
+                sscanf(line, "PPid: %d", &proc.ppid);
             }
-        } else {
-            // 如果 stat() 失败，打印错误信息
-            perror("stat");
+        }
+        fclose(file);
+
+        processes[proc_count++] = proc;
+    }
+    closedir(dir);
+}
+
+// 比较函数，用于 PID 排序
+int compare_by_pid(const void* a, const void* b) {
+    return ((Process*)a)->pid - ((Process*)b)->pid;
+}
+
+// 递归打印进程树
+void print_tree(int ppid, int depth) {
+    for (int i = 0; i < proc_count; i++) {
+        if (processes[i].ppid == ppid) {
+            for (int j = 0; j < depth; j++) {
+                printf("  ");  // 缩进
+            }
+            printf("%s", processes[i].name);
+            if (show_pids) {
+                printf("(%d)", processes[i].pid);
+            }
+            printf("\n");
+            print_tree(processes[i].pid, depth + 1);
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    int opt;
+    while ((opt = getopt(argc, argv, "pnV")) != -1) {
+        switch (opt) {
+            case 'p':
+                show_pids = 1;
+                break;
+            case 'n':
+                numeric_sort = 1;
+                break;
+            case 'V':
+                version_flag = 1;
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-p] [-n] [-V]\n", argv[0]);
+                exit(EXIT_FAILURE);
         }
     }
 
-    closedir(dir);  // 关闭目录
-}
+    if (version_flag) {
+        printf("pstree version 1.0\n");
+        exit(EXIT_SUCCESS);
+    }
 
-int main() {
-    const char *directory_path = ".";  // 当前目录
-    list_directory(directory_path);  // 列出当前目录下的文件和子目录
+    read_proc_info();
+
+    // 如果需要排序，按照 PID 排序
+    if (numeric_sort) {
+        qsort(processes, proc_count, sizeof(Process), compare_by_pid);
+    }
+
+    // 默认从 PID=1 开始打印进程树
+    print_tree(1, 0);
     return 0;
 }
