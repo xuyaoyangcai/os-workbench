@@ -1,288 +1,142 @@
 
 #include <stdio.h>
-#include <assert.h>
-#include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <stdlib.h>
-typedef struct pidinfo{
-    char name[50];
-    __pid_t pid;
-    __pid_t ppid;
-}PidInfo;
-PidInfo pidinfos[10000];
-int pid_count=0;
-char* readcmdops(int argc, char *argv[])//get commandline ops
-{
-    assert(argc>=1);
-    if(argc==1)//no ops
-    {
-        return NULL;
+#include <string.h>
+#include <assert.h>
+#include <dirent.h>
+#include <stdbool.h>
+
+typedef struct Process {
+    int processID;
+    char processName[256];
+    int parentID;
+    int parentIndex;  // 父亲在列表中的下标
+    struct Process* children[100]; // 假设每个进程最多有100个孩子
+    int childrenCnt;
+} Process;
+
+bool isNumeric(const char *str) {
+    while (*str) {
+        if (*str < '0' || *str > '9') return false;
+        str++;
     }
-    char *p=argv[1];
-    char ops[10];int j=0;
-    for(int i=0;i<strlen(p);i++)
-    {
-        if(p[i]=='-')
-        {
-            continue;
-        }
-        ops[j]=p[i];
-        j++;
-    }
-    strcpy(p,ops);
-    return p;
-}
-pid_t readprocessname_ppid(__pid_t pid,char name[])
-{
-    char *str=(char *)malloc(sizeof(char)*20);
-    if(str==NULL)
-    {
-        printf("malloc failed");
-        exit(1);
-    }
-    sprintf(str,"%d",pid);
-    char processpath[20]="/proc/";
-    strcat(processpath,str);
-    strcat(processpath,"/stat");
-    FILE *fp=fopen(processpath,"r");
-    if (fp){
-        char i;
-        __pid_t _pid,ppid;
-        char pname[40];
-        fscanf(fp,"%d (%s %c %d",&_pid,pname,&i,&ppid);
-        pname[strlen(pname)-1]='\0';
-        strcpy(name,pname);
-        assert(pid==_pid);
-        fclose(fp);
-        free(str);
-        return ppid;
-    }else{
-        printf("open failed");
-        free(str);
-        exit(1);
-    }
-}
-void setProcessInfo()
-{
-    DIR *dp=opendir("/proc");
-    if(!dp)
-    {
-        fprintf(stderr,"%s","Can 't open /proc/");
-        exit(1);
-    }
-    else
-    {
-        int pid=0;
-        struct dirent *entry;
-        while ((entry=readdir(dp))!=NULL)
-        {
-            if((pid=atoi(entry->d_name))==0)
-            {
-                continue;
-            }
-            else{// store in pidinfo (name and pid and ppid)
-                pidinfos[pid_count].pid=pid;
-                pidinfos[pid_count].ppid=readprocessname_ppid(pid,pidinfos[pid_count].name);
-                assert(pidinfos[pid_count].ppid>-1);
-                //printf("%d (%s) %d\n",pidinfos[pid_count].pid,pidinfos[pid_count].name,pidinfos[pid_count].ppid);
-                pid_count++;
-            }
-        }
-    }
+    return true;
 }
 
-typedef struct processtree{
-    pid_t pid;
-    char name[40];
-    struct childprocesses *children;
-}Processtree;
-struct childprocesses{
-    struct childprocesses *next;
-    Processtree *proc;
-};
+void getProcessList(Process* processList, int* count) {
+    assert(count);
+    int cnt = 0;
+    assert(processList);
+    DIR* procDir = opendir("/proc");
+    assert(procDir);
 
-void findallchildrens(int pid ,int index[])
-{
-    int indexcount=0;
-    size_t i= 0;
-    for (; i <pid_count-1; i+=2)
-    {
-        if(pidinfos[i].ppid==pid)
-        {
-            index[indexcount++]=i;
-        }
-        if(pidinfos[i+1].ppid==pid)
-        {
-            index[indexcount++]=i+1;
-        }
-    }
-    for (; i <pid_count; i++)
-    {
-        if(pidinfos[i].ppid==pid)
-        {
-            index[indexcount++]=i;
-        }
-    }
-}
-void creat_tree(Processtree * root,int tab_length)
-{
-    int flag=2;
-    char str[100]={0};
-    int allchildrensindex[500]={0}; // Log the index of all root child processes in Pidinfos
-    findallchildrens(root->pid,allchildrensindex);
-    root->children=(struct childprocesses*)malloc(sizeof(struct childprocesses));
-    if(root->children==NULL)
-    {
-        printf("malloc failed");
-        exit(1);
-    }
-    struct childprocesses *child=root->children;
-    if(allchildrensindex[0]==0)//it's leaf node,no child,return
-    {
-        printf("%s(%d)",root->name,root->pid);
-        return;
-    }
-    sprintf(str,"%s(%d)-",root->name,root->pid);
-    printf("%s",str);
-    if(allchildrensindex[1]!=0)
-    {
-        printf("+-");
-    }
-    else
-    {
-        flag=0;
-    }
-    for(int i=0;i<500 && allchildrensindex[i]!=0 ;i++)//Traverses all children of the process
-    {
-        child->proc=(Processtree *)malloc(sizeof(Processtree));
-        if(child->proc==NULL)
-        {
-            printf("malloc failed");
-            exit(1);
-        }
-        child->proc->pid=pidinfos[allchildrensindex[i]].pid;
-        strcpy(child->proc->name,pidinfos[allchildrensindex[i]].name);
-        creat_tree(child->proc,strlen(str)+tab_length+flag);   // recursive
-        if(i+1<500 && allchildrensindex[i+1]!=0)
-        {
-            child->next=(struct childprocesses*)malloc(sizeof(struct childprocesses));
-            if(child->next==NULL)
-            {
-                printf("malloc failed");
-                exit(1);
-            }
-            child=child->next;
-            char tabs[100];
-            printf("\n");
-            for (size_t i = 0; i <strlen(str)+tab_length; i++)
-            {
-                printf(" ");
-            }
-            printf("|-");
-        }
-    }
-    free(root);
-}
-void creat_tree_nopid(Processtree * root,int tab_length)
-{
-    int flag=2;
-    char str[100]={0};
-    int allchildrensindex[500]={0}; // Log the index of all root child processes in Pidinfos
-    findallchildrens(root->pid,allchildrensindex);
-    root->children=(struct childprocesses*)malloc(sizeof(struct childprocesses));
-    if(root->children==NULL)
-    {
-        printf("malloc failed");
-        exit(1);
-    }
-    struct childprocesses *child=root->children;
-    if(allchildrensindex[0]==0)//it's leaf node,no child,return
-    {
-        printf("%s",root->name);            //TODO 缺陷列表2  leafnode task:: /proc/pid/task/.../stat
-        return;
-    }
-    sprintf(str,"%s-",root->name);
-    printf("%s",str);
-    if(allchildrensindex[1]!=0)
-    {
-        printf("+-");
-    }
-    else
-    {
-        flag=0;
-    }
-    for(int i=0;i<500 && allchildrensindex[i]!=0 ;i++)//Traverses all children of the process
-    {
-        child->proc=(Processtree *)malloc(sizeof(Processtree));
-        if(child->proc==NULL)
-        {
-            printf("malloc failed");
-            exit(1);
-        }
-        child->proc->pid=pidinfos[allchildrensindex[i]].pid;
-        strcpy(child->proc->name,pidinfos[allchildrensindex[i]].name);
-        creat_tree_nopid(child->proc,strlen(str)+tab_length+flag);   // recursive
-        if(i+1<500 && allchildrensindex[i+1]!=0)
-        {
-            child->next=(struct childprocesses*)malloc(sizeof(struct childprocesses));
-            if(child->next==NULL)
-            {
-                printf("malloc failed");
-                exit(1);
-            }
-            child=child->next;
-            char tabs[100];
-            printf("\n");
-            for (size_t i = 0; i <strlen(str)+tab_length; i++)
-            {
-                printf(" ");
-            }
-            printf("|-");
-        }
-    }
-    free(root);
-}
-int main(int argc, char *argv[]) {
-    char* ops=readcmdops(argc,argv);//ops是选项
-    if(!ops)//ops为空时 默认
-    {
-        setProcessInfo();
-        Processtree *root=(Processtree *)malloc(sizeof(Processtree));
-        root->pid=pidinfos[0].pid;
-        strcpy(root->name,pidinfos[0].name);
-        creat_tree_nopid(root,0);
-    }
-    else
-    {
-        if(!strcmp(ops,"p"))   //ops = -p
-        {
-            //printf("%s",ops);
-            setProcessInfo();
-            Processtree *root=(Processtree *)malloc(sizeof(Processtree));
-            root->pid=pidinfos[0].pid;
-            strcpy(root->name,pidinfos[0].name);
-            creat_tree(root,0);
-        }
-        else if(!strcmp(ops,"n"))   //  -n
-        {
-            //printf("%s",ops);
-            setProcessInfo();
-            Processtree *root=(Processtree *)malloc(sizeof(Processtree));
-            root->pid=pidinfos[0].pid;
-            strcpy(root->name,pidinfos[0].name);
-            creat_tree_nopid(root,0);
+    struct dirent* entry;
+    while ((entry = readdir(procDir)) != NULL) {
+        if (entry->d_type == DT_DIR && isNumeric(entry->d_name)) {
+            char statusPath[512];
+            char line[256];
+            FILE* statusFile;
+            snprintf(statusPath, sizeof(statusPath), "/proc/%s/status", entry->d_name);
+            statusFile = fopen(statusPath, "r");
+            if (!statusFile) continue;
 
+            while (fgets(line, sizeof(line), statusFile) != NULL) {
+                if (strncmp(line, "Name:", 5) == 0) {
+                    sscanf(line, "Name:\t%s", processList[cnt].processName);
+                }
+                if (strncmp(line, "Pid:", 4) == 0) {
+                    sscanf(line, "Pid:\t%d", &processList[cnt].processID);
+                }
+                if (strncmp(line, "PPid:", 5) == 0) {
+                    sscanf(line, "PPid:\t%d", &processList[cnt].parentID);
+                }
+            }
+            fclose(statusFile);
+            processList[cnt].childrenCnt = 0;
+            cnt++;
         }
-        else if(!strcmp(ops,"V"))  //    -V
-        {
-            printf("pstree (PSmisc) UNKNOWN\nCopyright (C) 1993-2019 Werner Almesberger and Craig Small\nPSmisc comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under\nthe terms of the GNU General Public License.\nFor more information about these matters, see the files named COPYING.");
-        }
+    }
+    *count = cnt;
+    closedir(procDir);
+}
+
+int getParentIndex(Process* processList, int i) {
+    int a = 0, b = i - 1;
+    while (b >= a + 1) {
+        if (processList[b].processID == processList[i].parentID)
+            return b;
+        int k = (b - a) / 2 + a;
+        if (processList[k].processID == processList[i].parentID)
+            return k;
+        else if (processList[k].processID > processList[i].parentID)
+            b = k;
         else
-        {
-            printf("%s","wrong ops");
-            return -1;
+            a = k;
+    }
+    return -1;
+}
+
+void buildProcessTree(Process* processList, int* count) {
+    for (int i = 0; i < *count; i++) {
+        int index = getParentIndex(processList, i);
+        if (index == -1) continue;
+        processList[index].children[processList[index].childrenCnt++] = &processList[i];
+        assert(processList[index].childrenCnt <= 100);
+    }
+}
+
+void displayTree(Process* proc, int tabCnt, bool isFirst) {
+    if (isFirst)
+        printf("|");
+    else {
+        for (int i = 0; i < tabCnt; i++) {
+            printf("\t");
         }
     }
+    printf("%s(%d)(%d)\n", proc->processName, proc->processID, proc->parentID);
+
+    for (int i = 0; i < proc->childrenCnt; i++) {
+        displayTree(proc->children[i], tabCnt + 2, i == 0);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    Process processList[500];
+    int count = 0;
+    int opcode = 0;
+
+    for (int i = 0; i < argc; i++) {
+        assert(argv[i]);
+        if (strncmp(argv[i], "-p", 2) == 0 || strncmp(argv[i], "--show-pids", 11) == 0) {
+            opcode = 1;
+            break;
+        }
+        if (strncmp(argv[i], "-n", 2) == 0 || strncmp(argv[i], "--numeric-sort", 14) == 0) {
+            opcode = 2;
+            break;
+        }
+        if (strncmp(argv[i], "-V", 2) == 0 || strncmp(argv[i], "--version", 9) == 0) {
+            opcode = 3;
+            break;
+        }
+    }
+    assert(!argv[argc]);
+
+    switch (opcode) {
+        case 1:
+            getProcessList(processList, &count);
+            buildProcessTree(processList, &count);
+            displayTree(&processList[0], 0, 0);
+            break;
+        case 2:
+            break;
+        case 3:
+            break;
+        default:
+            printf("Display a tree of processes.\n");
+            printf("  -p, --show-pids\tshow PIDs\n");
+            printf("  -n, --numeric-sort\tsort output by PID\n");
+    }
+    printf("There are %d processes\n", count);
     return 0;
 }
