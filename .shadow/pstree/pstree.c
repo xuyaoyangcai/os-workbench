@@ -1,112 +1,205 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <dirent.h>
+#include <string.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
-#define MAX_PROCS 32768  // 进程数量最大限制
+#define MAX_PID_LENGTH 10
 
+// 定义进程信息结构体
 typedef struct Process {
-    int pid;
-    int ppid;
+    pid_t pid;
+    pid_t ppid;
     char name[256];
+    struct Process* next;
+    struct Process* children;
 } Process;
 
-Process processes[MAX_PROCS];
-int proc_count = 0;
-int show_pids = 0, numeric_sort = 0, version_flag = 0;
+// 函数声明
+Process* create_process(pid_t pid, pid_t ppid, const char* name);
+void add_child(Process* parent, Process* child);
+void free_process_tree(Process* root);
+void print_process_tree(Process* root, int indent_level, int show_pids);
+Process* get_process_info(pid_t pid);
+int parse_pid_file(const char* file_path, pid_t* pid);
+int parse_name_file(const char* file_path, char* name);
 
-// 读取 /proc 目录获取所有进程信息
-void read_proc_info() {
+// 获取进程信息
+Process* get_process_info(pid_t pid) {
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+
+    pid_t ppid;
+    char name[256];
+    if (parse_pid_file(path, &ppid) == -1 || parse_name_file(path, name) == -1) {
+        return NULL;
+    }
+
+    return create_process(pid, ppid, name);
+}
+
+// 创建一个进程节点
+Process* create_process(pid_t pid, pid_t ppid, const char* name) {
+    Process* new_process = (Process*)malloc(sizeof(Process));
+    if (!new_process) {
+        perror("Failed to allocate memory for process");
+        return NULL;
+    }
+    new_process->pid = pid;
+    new_process->ppid = ppid;
+    strncpy(new_process->name, name, sizeof(new_process->name) - 1);
+    new_process->name[sizeof(new_process->name) - 1] = '\0';
+    new_process->next = NULL;
+    new_process->children = NULL;
+    return new_process;
+}
+
+// 添加子进程
+void add_child(Process* parent, Process* child) {
+    if (parent->children == NULL) {
+        parent->children = child;
+    } else {
+        Process* temp = parent->children;
+        while (temp->next != NULL) {
+            temp = temp->next;
+        }
+        temp->next = child;
+    }
+}
+
+// 解析 `/proc/[pid]/stat` 文件，获取父进程 ID
+int parse_pid_file(const char* file_path, pid_t* ppid) {
+    FILE* fp = fopen(file_path, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    int ret = fscanf(fp, "%*d %*s %*c %d", ppid);
+    fclose(fp);
+    return ret == 1 ? 0 : -1;
+}
+
+// 解析 `/proc/[pid]/stat` 文件，获取进程名称
+int parse_name_file(const char* file_path, char* name) {
+    FILE* fp = fopen(file_path, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    int ret = fscanf(fp, "%*d %255s", name);
+    fclose(fp);
+    return ret == 1 ? 0 : -1;
+}
+
+// 打印进程树
+void print_process_tree(Process* root, int indent_level, int show_pids) {
+    if (!root) return;
+
+    // 打印缩进
+    for (int i = 0; i < indent_level; i++) {
+        printf("  ");
+    }
+
+    printf("%s", root->name);
+    if (show_pids) {
+        printf(" (%d)", root->pid);
+    }
+    printf("\n");
+
+    // 打印子进程
+    Process* child = root->children;
+    while (child != NULL) {
+        print_process_tree(child, indent_level + 1, show_pids);
+        child = child->next;
+    }
+}
+
+// 递归释放进程树
+void free_process_tree(Process* root) {
+    if (!root) return;
+
+    Process* child = root->children;
+    while (child != NULL) {
+        Process* next_child = child->next;
+        free_process_tree(child);
+        child = next_child;
+    }
+
+    free(root);
+}
+
+// 获取所有的进程 PID 列表
+void get_all_processes(Process** processes) {
     DIR* dir = opendir("/proc");
     if (!dir) {
-        perror("opendir");
-        exit(EXIT_FAILURE);
+        perror("Failed to open /proc directory");
+        return;
     }
 
     struct dirent* entry;
-    while ((entry = readdir(dir))) {
-        if (!isdigit(entry->d_name[0])) continue;  // 只处理数字 PID
-
-        char path[512], line[256];
-        snprintf(path, sizeof(path), "/proc/%s/status", entry->d_name);
-
-        FILE* file = fopen(path, "r");
-        if (!file) continue;
-
-        Process proc = {0};
-        proc.pid = atoi(entry->d_name);
-
-        while (fgets(line, sizeof(line), file)) {
-            if (strncmp(line, "Name:", 5) == 0) {
-                sscanf(line, "Name: %255s", proc.name);
-            } else if (strncmp(line, "PPid:", 5) == 0) {
-                sscanf(line, "PPid: %d", &proc.ppid);
+    while ((entry = readdir(dir)) != NULL) {
+        if (isdigit(entry->d_name[0])) {
+            pid_t pid = atoi(entry->d_name);
+            Process* proc = get_process_info(pid);
+            if (proc) {
+                processes[pid] = proc;
             }
         }
-        fclose(file);
-
-        processes[proc_count++] = proc;
     }
+
     closedir(dir);
 }
 
-// 比较函数，用于 PID 排序
-int compare_by_pid(const void* a, const void* b) {
-    return ((Process*)a)->pid - ((Process*)b)->pid;
+// 构建进程树
+void build_process_tree(Process** processes) {
+    for (int i = 0; i < 32768; i++) {
+        if (processes[i] != NULL) {
+            pid_t ppid = processes[i]->ppid;
+            if (ppid != 0 && ppid != i) {
+                if (processes[ppid] != NULL) {
+                    add_child(processes[ppid], processes[i]);
+                }
+            }
+        }
+    }
 }
 
-// 递归打印进程树
-void print_tree(int ppid, int depth) {
-    for (int i = 0; i < proc_count; i++) {
-        if (processes[i].ppid == ppid) {
-            for (int j = 0; j < depth; j++) {
-                printf("  ");  // 缩进
-            }
-            printf("%s", processes[i].name);
-            if (show_pids) {
-                printf("(%d)", processes[i].pid);
-            }
-            printf("\n");
-            print_tree(processes[i].pid, depth + 1);
+// 解析命令行参数
+void parse_args(int argc, char* argv[], int* show_pids, int* numeric_sort) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--show-pids") == 0) {
+            *show_pids = 1;
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--numeric-sort") == 0) {
+            *numeric_sort = 1;
+        } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("pstree version 1.0\n");
+            exit(0);
         }
     }
 }
 
 int main(int argc, char* argv[]) {
-    int opt;
-    while ((opt = getopt(argc, argv, "pnV")) != -1) {
-        switch (opt) {
-            case 'p':
-                show_pids = 1;
-                break;
-            case 'n':
-                numeric_sort = 1;
-                break;
-            case 'V':
-                version_flag = 1;
-                break;
-            default:
-                fprintf(stderr, "Usage: %s [-p] [-n] [-V]\n", argv[0]);
-                exit(EXIT_FAILURE);
-        }
+    int show_pids = 0;
+    int numeric_sort = 0;
+    parse_args(argc, argv, &show_pids, &numeric_sort);
+
+    Process* processes[32768] = {0};
+    get_all_processes(processes);
+    build_process_tree(processes);
+
+    // 假设进程 ID 1 是 root 进程
+    if (processes[1]) {
+        print_process_tree(processes[1], 0, show_pids);
     }
 
-    if (version_flag) {
-        printf("pstree\n");
-        exit(EXIT_SUCCESS);
+    // 释放内存
+    for (int i = 0; i < 32768; i++) {
+        free_process_tree(processes[i]);
     }
 
-    read_proc_info();
-
-    // 如果需要排序，按照 PID 排序
-    if (numeric_sort) {
-        qsort(processes, proc_count, sizeof(Process), compare_by_pid);
-    }
-
-    // 默认从 PID=1 开始打印进程树
-    print_tree(1, 0);
     return 0;
 }
+
