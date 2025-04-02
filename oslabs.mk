@@ -1,4 +1,4 @@
-export TOKEN := ???
+export TOKEN :=48f34a3b-a6f4-4eda-8b40-7875b4750f80
 
 # ----- DO NOT MODIFY -----
 
