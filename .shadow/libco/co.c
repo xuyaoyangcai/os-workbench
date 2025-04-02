@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <assert.h>
 
-#define STACK_SIZE 3200 / sizeof(uint8_t) * 1024
-#define CO_SIZE 128000
+#define STACK_SIZE 256 / sizeof(uint8_t) * 1024
+#define CO_SIZE 512
 
 enum co_status {
     CO_NEW = 1, // 新创建，还未执行过
