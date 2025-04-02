@@ -1,116 +1,151 @@
 #include "co.h"
 #include <stdlib.h>
+#include <string.h>
 #include <setjmp.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <assert.h>
-#include <string.h>
-#include <time.h>
-#include <stdbool.h>
 
-#define STACK_SIZE 4 * 1024 * 8 // 32 KiB stack per coroutine
-
-static inline void stack_switch_call(void *sp, void *entry, uintptr_t arg) {
-    asm volatile(
-#if __x86_64__
-        "movq %%rsp,-0x10(%0); leaq -0x20(%0), %%rsp; movq %2, %%rdi ; call *%1; movq -0x10(%0) ,%%rsp;"
-        :
-        : "b"((uintptr_t)sp), "d"(entry), "a"(arg)
-        : "memory"
-#else
-            "movl %%esp, -0x8(%0); leal -0xC(%0), %%esp; movl %2, -0xC(%0); call *%1; movl -0x8(%0), %%esp"
-            :
-            : "b"((uintptr_t)sp), "d"(entry), "a"(arg)
-            : "memory"
-#endif
-            );
-}
+#define STACK_SIZE 32 / sizeof(uint8_t) * 1024
+#define CO_SIZE 128
 
 enum co_status {
-    CO_NEW = 1,
-    CO_RUNNING = 2,
-    CO_WAITING = 3,
-    CO_DEAD = 4,
+    CO_NEW = 1, // 新创建，还未执行过
+    CO_RUNNING, // 已经执行过
+    CO_WAITING, // 在 co_wait 上等待
+    CO_DEAD,    // 已经结束，但还未释放资源
 };
 
 struct co {
-    struct co *next;
-    void (*func)(void *);
+    char name[30];
+    void (*func)(void *); // co_start 指定的入口地址和参数
     void *arg;
-    char name[50];
-    enum co_status status;
-    struct co *waiter;
-    jmp_buf context;
-    uint8_t stack[STACK_SIZE];
+
+    enum co_status status;  // 协程的状态
+    struct co *    waiter;  // 是否有其他协程在等待当前协程
+    jmp_buf        context; // 寄存器现场 (setjmp.h)
+    uint8_t        stack[STACK_SIZE]__attribute__((aligned(16))); // 协程的堆栈
 };
 
-struct co *current = NULL;
-struct co *ready_queue = NULL; // 就绪队列
+struct co *current; // 当前运行的协程
+struct co *co_list[CO_SIZE]; // 所有协程的数组
+int co_num; // 当前协程数
+
+// 随机挑选出一个协程
+struct co *get_next_co() {
+    int count = 0;
+    for (int i = 0; i < co_num; ++i) {
+        assert(co_list[i]);
+        if (co_list[i]->status == CO_NEW || co_list[i]->status == CO_RUNNING) {
+            ++count;
+        }
+    }
+
+    int id = rand() % count, i = 0;
+    for (i = 0; i < co_num; ++i) {
+        if (co_list[i]->status == CO_NEW || co_list[i]->status == CO_RUNNING) {
+            if (id == 0) {
+                break;
+            }
+            --id;
+        }
+    }
+    return co_list[i];
+}
 
 struct co *co_start(const char *name, void (*func)(void *), void *arg) {
-    struct co *start = (struct co *)malloc(sizeof(struct co));
-    start->arg = arg;
-    start->func = func;
-    start->status = CO_NEW;
-    strcpy(start->name, name);
-    if (current == NULL) {
-        current = (struct co *)malloc(sizeof(struct co));
-        current->status = CO_RUNNING;
-        current->waiter = NULL;
-        strcpy(current->name, "main");
-        current->next = current;
-    }
+    struct co* res = (struct co*)malloc(sizeof(struct co));
+    strcpy(res->name, name);
+    res->func = func;
+    res->arg = arg;
+    res->status = CO_NEW;
+    res->waiter = NULL;
+    assert(co_num < CO_SIZE);
+    co_list[co_num++] = res;
 
-    struct co *h = current;
-    while (h->next != current) {
-        h = h->next;
-    }
-    h->next = start;
-    start->next = current;
-
-    // 将新协程加入就绪队列
-    start->next = ready_queue;
-    ready_queue = start;
-    return start;
+    return res;
 }
 
 void co_wait(struct co *co) {
-    current->status = CO_WAITING;
+    assert(co != NULL);
     co->waiter = current;
+    current->status = CO_WAITING;
     while (co->status != CO_DEAD) {
         co_yield();
     }
-    current->status = CO_RUNNING;
-
-    struct co *h = current;
-    while (h->next != co) {
-        h = h->next;
-    }
-    h->next = h->next->next;
     free(co);
+    int id = 0;
+    for (id = 0; id < co_num; ++id) {
+        if (co_list[id] == co) {
+            break;
+        }
+    }
+    while (id < co_num - 1) {
+        co_list[id] = co_list[id+1];
+        ++id;
+    }
+    --co_num;
+    co_list[co_num] = NULL;
 }
 
 void co_yield() {
-    assert(current);
     int val = setjmp(current->context);
     if (val == 0) {
-        struct co *co_next = ready_queue;
-        if (co_next) {
-            ready_queue = co_next->next;
-            current = co_next;
-            if (co_next->status == CO_NEW) {
-                co_next->status = CO_RUNNING;
-                stack_switch_call(&co_next->stack[STACK_SIZE], co_next->func, (uintptr_t)co_next->arg);
-                co_next->status = CO_DEAD;
-                if (co_next->waiter) {
-                    current = co_next->waiter;
-                }
-            } else {
-                longjmp(co_next->context, 1);
+        struct co *next = get_next_co();
+        current = next;
+        if (next->status == CO_NEW) {
+            next->status = CO_RUNNING;
+            asm volatile(
+#if __x86_64__
+                "movq %%rdi, (%0); movq %0, %%rsp; movq %2, %%rdi; call *%1"
+                :
+                : "b"((uintptr_t)(next->stack + sizeof(next->stack))), "d"(next->func), "a"((uintptr_t)(next->arg))
+                : "memory"
+#else
+                    "movl %%esp, 0x8(%0); movl %%ecx, 0x4(%0); movl %0, %%esp; movl %2, (%0); call *%1"
+                    :
+                    : "b"((uintptr_t)(next->stack + sizeof(next->stack) - 8)), "d"(next->func), "a"((uintptr_t)(next->arg))
+                    : "memory"
+#endif
+                    );
+
+            asm volatile(
+#if __x86_64__
+                "movq (%0), %%rdi"
+                :
+                : "b"((uintptr_t)(next->stack + sizeof(next->stack)))
+                : "memory"
+#else
+                    "movl 0x8(%0), %%esp; movl 0x4(%0), %%ecx"
+                    :
+                    : "b"((uintptr_t)(next->stack + sizeof(next->stack) - 8))
+                    : "memory"
+#endif
+                    );
+
+            next->status = CO_DEAD;
+
+            if (current->waiter) {
+                current = current->waiter;
+                longjmp(current->context, 1);
             }
+            co_yield();
+        } else if (next->status == CO_RUNNING) {
+            longjmp(next->context, 1);
         } else {
-            // 如果没有其他协程就绪，切换回 main
-            current = current->next;
+            assert(0);
         }
+    } else {
+        // longjmp返回，不处理
     }
+}
+
+__attribute__((constructor)) void init() {
+    struct co* main = (struct co*)malloc(sizeof(struct co));
+    strcpy(main->name, "main");
+    main->status = CO_RUNNING;
+    main->waiter = NULL;
+    current = main;
+    co_num = 1;
+    memset(co_list, 0, sizeof(co_list));
+    co_list[0] = main;
 }
