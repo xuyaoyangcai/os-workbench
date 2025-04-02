@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <assert.h>
 
-#define STACK_SIZE 32 / sizeof(uint8_t) * 1024
+#define STACK_SIZE 3200 / sizeof(uint8_t) * 1024
 #define CO_SIZE 128000
 
 enum co_status {
