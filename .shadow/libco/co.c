@@ -6,7 +6,7 @@
 #include <assert.h>
 
 #define STACK_SIZE 32 / sizeof(uint8_t) * 1024
-#define CO_SIZE 128
+#define CO_SIZE 128000
 
 enum co_status {
     CO_NEW = 1, // 新创建，还未执行过
