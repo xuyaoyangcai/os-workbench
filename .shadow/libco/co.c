@@ -7,7 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdbool.h>
-#define CO_SIZE 200
+#define CO_SIZE 2000
 
 static inline void stack_switch_call(void *sp, void *entry, uintptr_t arg)
 {
@@ -30,7 +30,7 @@ enum co_status
     CO_NEW = 1,
     CO_RUNNING = 2,
     CO_WAITING = 3,
-    CO_DEAD = 4,	
+    CO_DEAD = 4,
 };
 
 #define STACK_SIZE 4 * 1024 * 8
