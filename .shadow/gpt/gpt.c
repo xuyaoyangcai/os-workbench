@@ -1,6 +1,6 @@
 // Original Author: Andrej Karpathy
 // https://github.com/karpathy/llm.c
-
+#pragma once
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
