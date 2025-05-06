@@ -12,28 +12,22 @@
 #include "thread.h"
 #include "thread-sync.h"
 
+
+
 // ----------------------------------------------------------------------------
 // all the individual layers' forward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
 void encoder_forward(float* out,
-                   int* inp, float* wte, float* wpe,
-                   int B, int T, int C) {
-    // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
-    // inp is (B,T) of integers, holding the token ids at each (b,t) position
-    // wte is (V,C) of token embeddings, short for "weight token embeddings"
-    // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
+                     int* inp, float* wte, float* wpe,
+                     int B, int T, int C) {
+#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
-            // get the index of the token at inp[b, t]
             int ix = inp[b * T + t];
-            // seek to the position in wte corresponding to the token
             float* wte_ix = wte + ix * C;
-            // seek to the position in wpe corresponding to the position
             float* wpe_t = wpe + t * C;
-            // add the two vectors and store the result in out[b,t,:]
             for (int i = 0; i < C; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
             }
@@ -41,62 +35,51 @@ void encoder_forward(float* out,
     }
 }
 
+
 void layernorm_forward(float* out, float* mean, float* rstd,
                        float* inp, float* weight, float* bias,
                        int B, int T, int C) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
-    // both inp and out are (B,T,C) of the activations
-    // mean and rstd are (B,T) buffers, to be used later in backward pass
-    // at each position (b,t) of the input, the C-dimensional vector
-    // of activations gets normalized, then scaled and shifted
     float eps = 1e-5f;
+#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // seek to the input position inp[b,t,:]
             float* x = inp + b * T * C + t * C;
-            // calculate the mean
             float m = 0.0f;
             for (int i = 0; i < C; i++) {
                 m += x[i];
             }
-            m = m/C;
-            // calculate the variance (without any bias correction)
+            m = m / C;
             float v = 0.0f;
             for (int i = 0; i < C; i++) {
                 float xshift = x[i] - m;
                 v += xshift * xshift;
             }
-            v = v/C;
-            // calculate the rstd (reciprocal standard deviation)
+            v = v / C;
             float s = 1.0f / sqrtf(v + eps);
-            // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalize
-                float o = n * weight[i] + bias[i]; // scale and shift
-                out_bt[i] = o; // write
+                float n = (s * (x[i] - m));
+                float o = n * weight[i] + bias[i];
+                out_bt[i] = o;
             }
-            // cache the mean and rstd for the backward pass later
             mean[b * T + t] = m;
             rstd[b * T + t] = s;
         }
     }
 }
 
+
 void matmul_forward(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
-    // most of the running time is spent here and in matmul_backward
-    // OC is short for "output channels"
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // out will be (B,T,OC)
+#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* out_bt = out + b * T * OC + t * OC;
             float* inp_bt = inp + b * T * C + t * C;
             for (int o = 0; o < OC; o++) {
                 float val = (bias != NULL) ? bias[o] : 0.0f;
-                float* wrow = weight + o*C;
+                float* wrow = weight + o * C;
                 for (int i = 0; i < C; i++) {
                     val += inp_bt[i] * wrow[i];
                 }
@@ -106,33 +89,25 @@ void matmul_forward(float* out,
     }
 }
 
+
 void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
-    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
-    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
-    // that holds the pre-attention and post-attention scores (used in backward)
-    // output is (B, T, C)
-    // attention is the only layer that mixes information across time
-    // every other operation is applied at every (b,t) position independently
-    // (and of course, no layer mixes information across batch)
-    int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    int C3 = C * 3;
+    int hs = C / NH;  // head size
+    float scale = 1.0f / sqrtf(hs);
 
+#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
                 float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
+                float* att_bth = att + b * NH * T * T + h * T * T + t * T;
 
-                // pass 1: calculate query dot key and maxval
-                float maxval = -10000.0f; // TODO something better
+                float maxval = -10000.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-
-                    // (query_t) dot (key_t2)
+                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
                     float val = 0.0f;
                     for (int i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
@@ -145,8 +120,6 @@ void attention_forward(float* out, float* preatt, float* att,
                     preatt_bth[t2] = val;
                 }
 
-                // pass 2: calculate the exp and keep track of sum
-                // maxval is being calculated and subtracted only for numerical stability
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
@@ -155,22 +128,18 @@ void attention_forward(float* out, float* preatt, float* att,
                 }
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
-                // pass 3: normalize to get the softmax
                 for (int t2 = 0; t2 < T; t2++) {
                     if (t2 <= t) {
                         att_bth[t2] *= expsum_inv;
                     } else {
-                        // causal attention mask. not strictly necessary to set to zero here
-                        // only doing this explicitly for debugging and checking to PyTorch
                         att_bth[t2] = 0.0f;
                     }
                 }
 
-                // pass 4: accumulate weighted values into the output of attention
                 float* out_bth = out + b * T * C + t * C + h * hs;
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2;
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
@@ -181,15 +150,17 @@ void attention_forward(float* out, float* preatt, float* att,
     }
 }
 
+
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
-    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
+#pragma omp parallel for
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
         out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
+
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     for (int i = 0; i < N; i++) {
