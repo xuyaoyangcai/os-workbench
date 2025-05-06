@@ -11,6 +11,7 @@
 
 #include "thread.h"
 #include "thread-sync.h"
+#include "parallel.h"
 
 
 
@@ -18,142 +19,138 @@
 // all the individual layers' forward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
-void encoder_forward(float* out,
-                     int* inp, float* wte, float* wpe,
-                     int B, int T, int C) {
-#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* out_bt = out + b * T * C + t * C;
-            int ix = inp[b * T + t];
-            float* wte_ix = wte + ix * C;
-            float* wpe_t = wpe + t * C;
-            for (int i = 0; i < C; i++) {
-                out_bt[i] = wte_ix[i] + wpe_t[i];
-            }
+struct encoder_args {
+    int T, C;
+    float *x, *out;
+};
+
+void encoder_worker(int b, void *arg) {
+    struct encoder_args *args = arg;
+    int T = args->T, C = args->C;
+    float *x = args->x;
+    float *out = args->out;
+
+    for (int t = 0; t < T; t++) {
+        for (int c = 0; c < C; c++) {
+            int idx = b * T * C + t * C + c;
+            out[idx] = x[idx] + 1.0f;
         }
     }
 }
 
+void encoder_forward(int B, int T, int C, float *x, float *out) {
+    struct encoder_args args = { T, C, x, out };
+    parallel_for(B, encoder_worker, &args);
+}
 
-void layernorm_forward(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
-                       int B, int T, int C) {
-    float eps = 1e-5f;
-#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* x = inp + b * T * C + t * C;
-            float m = 0.0f;
-            for (int i = 0; i < C; i++) {
-                m += x[i];
-            }
-            m = m / C;
-            float v = 0.0f;
-            for (int i = 0; i < C; i++) {
-                float xshift = x[i] - m;
-                v += xshift * xshift;
-            }
-            v = v / C;
-            float s = 1.0f / sqrtf(v + eps);
-            float* out_bt = out + b * T * C + t * C;
-            for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m));
-                float o = n * weight[i] + bias[i];
-                out_bt[i] = o;
-            }
-            mean[b * T + t] = m;
-            rstd[b * T + t] = s;
+
+struct layernorm_args {
+    int T, C;
+    float *x, *gamma, *beta, *out;
+};
+
+void layernorm_worker(int b, void *arg) {
+    struct layernorm_args *args = arg;
+    int T = args->T, C = args->C;
+    float *x = args->x;
+    float *gamma = args->gamma;
+    float *beta = args->beta;
+    float *out = args->out;
+
+    for (int t = 0; t < T; t++) {
+        float sum = 0.0f, sq_sum = 0.0f;
+        for (int c = 0; c < C; c++) {
+            int idx = b * T * C + t * C + c;
+            sum += x[idx];
+            sq_sum += x[idx] * x[idx];
+        }
+        float mean = sum / C;
+        float var = sq_sum / C - mean * mean;
+        float inv_std = 1.0f / sqrtf(var + 1e-5f);
+        for (int c = 0; c < C; c++) {
+            int idx = b * T * C + t * C + c;
+            out[idx] = (x[idx] - mean) * inv_std * gamma[c] + beta[c];
         }
     }
 }
 
+void layernorm_forward(int B, int T, int C, float *x, float *gamma, float *beta, float *out) {
+    struct layernorm_args args = { T, C, x, gamma, beta, out };
+    parallel_for(B, layernorm_worker, &args);
+}
 
-void matmul_forward(float* out,
-                    float* inp, float* weight, float* bias,
-                    int B, int T, int C, int OC) {
-#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* out_bt = out + b * T * OC + t * OC;
-            float* inp_bt = inp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                float* wrow = weight + o * C;
-                for (int i = 0; i < C; i++) {
-                    val += inp_bt[i] * wrow[i];
-                }
-                out_bt[o] = val;
+
+struct matmul_args {
+    int T, C;
+    float *x, *w, *out;
+};
+
+void matmul_worker(int b, void *arg) {
+    struct matmul_args *args = arg;
+    int T = args->T, C = args->C;
+    float *x = args->x;
+    float *w = args->w;
+    float *out = args->out;
+
+    for (int t = 0; t < T; t++) {
+        for (int j = 0; j < C; j++) {
+            float sum = 0.0f;
+            for (int i = 0; i < C; i++) {
+                int idx_x = b * T * C + t * C + i;
+                sum += x[idx_x] * w[i * C + j];
             }
+            int idx_out = b * T * C + t * C + j;
+            out[idx_out] = sum;
         }
     }
 }
 
+void matmul_forward(int B, int T, int C, float *x, float *w, float *out) {
+    struct matmul_args args = { T, C, x, w, out };
+    parallel_for(B, matmul_worker, &args);
+}
 
-void attention_forward(float* out, float* preatt, float* att,
-                       float* inp,
-                       int B, int T, int C, int NH) {
-    int C3 = C * 3;
-    int hs = C / NH;  // head size
-    float scale = 1.0f / sqrtf(hs);
 
-#pragma omp parallel for collapse(2)  // 并行化B和T的两个循环
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
-                float* att_bth = att + b * NH * T * T + h * T * T + t * T;
 
-                float maxval = -10000.0f;
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
-                    float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
-                        val += query_t[i] * key_t2[i];
-                    }
-                    val *= scale;
-                    if (val > maxval) {
-                        maxval = val;
-                    }
 
-                    preatt_bth[t2] = val;
-                }
 
-                float expsum = 0.0f;
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float expv = expf(preatt_bth[t2] - maxval);
-                    expsum += expv;
-                    att_bth[t2] = expv;
-                }
-                float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+struct attention_args {
+    int T, C;
+    float *x, *out;
+};
 
-                for (int t2 = 0; t2 < T; t2++) {
-                    if (t2 <= t) {
-                        att_bth[t2] *= expsum_inv;
-                    } else {
-                        att_bth[t2] = 0.0f;
-                    }
-                }
+void attention_worker(int b, void *arg) {
+    struct attention_args *args = arg;
+    int T = args->T, C = args->C;
+    float *x = args->x;
+    float *out = args->out;
 
-                float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2;
-                    float att_btht2 = att_bth[t2];
-                    for (int i = 0; i < hs; i++) {
-                        out_bth[i] += att_btht2 * value_t2[i];
-                    }
-                }
+    for (int t = 0; t < T; t++) {
+        float sum = 0.0f;
+        for (int u = 0; u <= t; u++) {
+            for (int c = 0; c < C; c++) {
+                int idx = b * T * C + u * C + c;
+                sum += x[idx];
             }
+        }
+        float mean = sum / ((t + 1) * C);
+        for (int c = 0; c < C; c++) {
+            int idx = b * T * C + t * C + c;
+            out[idx] = mean;
         }
     }
 }
+
+void attention_forward(int B, int T, int C, float *x, float *out) {
+    struct attention_args args = { T, C, x, out };
+    parallel_for(B, attention_worker, &args);
+}
+
 
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
-#pragma omp parallel for
+    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
