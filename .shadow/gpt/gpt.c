@@ -46,7 +46,7 @@ void encoder_forward_worker(int id) {
     }
 }
 
-void encoder_forward_parallel(float* out, int* inp, float* wte, float* wpe,
+void encoder_forward(float* out, int* inp, float* wte, float* wpe,
                               int B, int T, int C, int nthreads) {
     encoder_args = (struct encoder_params){ out, inp, wte, wpe, B, T, C, nthreads };
     for (int i = 0; i < nthreads; i++) {
