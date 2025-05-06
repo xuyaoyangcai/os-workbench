@@ -56,62 +56,74 @@ void encoder_forward(float* out, int* inp, float* wte, float* wpe,
 }
 
 
-void layernorm_forward(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
-                       int B, int T, int C) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
-    // both inp and out are (B,T,C) of the activations
-    // mean and rstd are (B,T) buffers, to be used later in backward pass
-    // at each position (b,t) of the input, the C-dimensional vector
-    // of activations gets normalized, then scaled and shifted
+struct layernorm_params {
+    float* out; float* mean; float* rstd;
+    float* inp; float* weight; float* bias;
+    int B, T, C;
+    int nthreads;
+} layernorm_args;
+
+void layernorm_worker(int id) {
+    int B = layernorm_args.B, T = layernorm_args.T, C = layernorm_args.C;
+    int n = layernorm_args.nthreads;
+    int b_per_thread = (B + n - 1) / n;
+    int b_start = id * b_per_thread;
+    int b_end = (b_start + b_per_thread > B) ? B : b_start + b_per_thread;
     float eps = 1e-5f;
-    for (int b = 0; b < B; b++) {
+
+    for (int b = b_start; b < b_end; b++) {
         for (int t = 0; t < T; t++) {
-            // seek to the input position inp[b,t,:]
-            float* x = inp + b * T * C + t * C;
-            // calculate the mean
+            float* x = layernorm_args.inp + b * T * C + t * C;
             float m = 0.0f;
-            for (int i = 0; i < C; i++) {
-                m += x[i];
-            }
-            m = m/C;
-            // calculate the variance (without any bias correction)
+            for (int i = 0; i < C; i++) m += x[i];
+            m /= C;
             float v = 0.0f;
             for (int i = 0; i < C; i++) {
-                float xshift = x[i] - m;
-                v += xshift * xshift;
+                float shift = x[i] - m;
+                v += shift * shift;
             }
-            v = v/C;
-            // calculate the rstd (reciprocal standard deviation)
+            v /= C;
             float s = 1.0f / sqrtf(v + eps);
-            // seek to the output position in out[b,t,:]
-            float* out_bt = out + b * T * C + t * C;
+            float* out_bt = layernorm_args.out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalize
-                float o = n * weight[i] + bias[i]; // scale and shift
-                out_bt[i] = o; // write
+                float n = s * (x[i] - m);
+                out_bt[i] = n * layernorm_args.weight[i] + layernorm_args.bias[i];
             }
-            // cache the mean and rstd for the backward pass later
-            mean[b * T + t] = m;
-            rstd[b * T + t] = s;
+            layernorm_args.mean[b * T + t] = m;
+            layernorm_args.rstd[b * T + t] = s;
         }
     }
 }
 
-void matmul_forward(float* out,
-                    float* inp, float* weight, float* bias,
-                    int B, int T, int C, int OC) {
-    // most of the running time is spent here and in matmul_backward
-    // OC is short for "output channels"
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // out will be (B,T,OC)
-    for (int b = 0; b < B; b++) {
+void layernorm_forward(float* out, float* mean, float* rstd,
+                                float* inp, float* weight, float* bias,
+                                int B, int T, int C, int nthreads) {
+    layernorm_args = (struct layernorm_params){ out, mean, rstd, inp, weight, bias, B, T, C, nthreads };
+    for (int i = 0; i < nthreads; i++) create(layernorm_worker);
+    join();
+}
+
+
+struct matmul_params {
+    float* out; float* inp; float* weight; float* bias;
+    int B, T, C, OC;
+    int nthreads;
+} matmul_args;
+
+void matmul_worker(int id) {
+    int B = matmul_args.B, T = matmul_args.T, C = matmul_args.C, OC = matmul_args.OC;
+    int n = matmul_args.nthreads;
+    int b_per_thread = (B + n - 1) / n;
+    int b_start = id * b_per_thread;
+    int b_end = (b_start + b_per_thread > B) ? B : b_start + b_per_thread;
+
+    for (int b = b_start; b < b_end; b++) {
         for (int t = 0; t < T; t++) {
-            float* out_bt = out + b * T * OC + t * OC;
-            float* inp_bt = inp + b * T * C + t * C;
+            float* out_bt = matmul_args.out + b * T * OC + t * OC;
+            float* inp_bt = matmul_args.inp + b * T * C + t * C;
             for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                float* wrow = weight + o*C;
+                float val = (matmul_args.bias != NULL) ? matmul_args.bias[o] : 0.0f;
+                float* wrow = matmul_args.weight + o * C;
                 for (int i = 0; i < C; i++) {
                     val += inp_bt[i] * wrow[i];
                 }
@@ -121,74 +133,62 @@ void matmul_forward(float* out,
     }
 }
 
-void attention_forward(float* out, float* preatt, float* att,
-                       float* inp,
-                       int B, int T, int C, int NH) {
-    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
-    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
-    // that holds the pre-attention and post-attention scores (used in backward)
-    // output is (B, T, C)
-    // attention is the only layer that mixes information across time
-    // every other operation is applied at every (b,t) position independently
-    // (and of course, no layer mixes information across batch)
-    int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+void matmul_forward(float* out, float* inp, float* weight, float* bias,
+                             int B, int T, int C, int OC, int nthreads) {
+    matmul_args = (struct matmul_params){ out, inp, weight, bias, B, T, C, OC, nthreads };
+    for (int i = 0; i < nthreads; i++) create(matmul_worker);
+    join();
+}
 
-    for (int b = 0; b < B; b++) {
+
+struct attn_params {
+    float* out; float* preatt; float* att; float* inp;
+    int B, T, C, NH;
+    int nthreads;
+} attn_args;
+
+void attention_worker(int id) {
+    int B = attn_args.B, T = attn_args.T, C = attn_args.C, NH = attn_args.NH;
+    int hs = C / NH;
+    float scale = 1.0f / sqrtf(hs);
+    int n = attn_args.nthreads;
+    int b_per_thread = (B + n - 1) / n;
+    int b_start = id * b_per_thread;
+    int b_end = (b_start + b_per_thread > B) ? B : b_start + b_per_thread;
+
+    for (int b = b_start; b < b_end; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                float* query_t = attn_args.inp + b * T * C * 3 + t * C * 3 + h * hs;
+                float* preatt_bth = attn_args.preatt + b * NH * T * T + h * T * T + t * T;
+                float* att_bth = attn_args.att + b * NH * T * T + h * T * T + t * T;
 
-                // pass 1: calculate query dot key and maxval
-                float maxval = -10000.0f; // TODO something better
+                float maxval = -10000.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-
-                    // (query_t) dot (key_t2)
+                    float* key_t2 = attn_args.inp + b * T * C * 3 + t2 * C * 3 + h * hs + C;
                     float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
-                        val += query_t[i] * key_t2[i];
-                    }
+                    for (int i = 0; i < hs; i++) val += query_t[i] * key_t2[i];
                     val *= scale;
-                    if (val > maxval) {
-                        maxval = val;
-                    }
-
                     preatt_bth[t2] = val;
+                    if (val > maxval) maxval = val;
                 }
 
-                // pass 2: calculate the exp and keep track of sum
-                // maxval is being calculated and subtracted only for numerical stability
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
-                    expsum += expv;
                     att_bth[t2] = expv;
+                    expsum += expv;
                 }
-                float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+                float inv = 1.0f / expsum;
+                for (int t2 = 0; t2 < T; t2++) att_bth[t2] = (t2 <= t) ? att_bth[t2] * inv : 0.0f;
 
-                // pass 3: normalize to get the softmax
-                for (int t2 = 0; t2 < T; t2++) {
-                    if (t2 <= t) {
-                        att_bth[t2] *= expsum_inv;
-                    } else {
-                        // causal attention mask. not strictly necessary to set to zero here
-                        // only doing this explicitly for debugging and checking to PyTorch
-                        att_bth[t2] = 0.0f;
-                    }
-                }
-
-                // pass 4: accumulate weighted values into the output of attention
-                float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                float* out_bth = attn_args.out + b * T * C + t * C + h * hs;
+                for (int i = 0; i < hs; i++) out_bth[i] = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float att_btht2 = att_bth[t2];
+                    float* value_t2 = attn_args.inp + b * T * C * 3 + t2 * C * 3 + h * hs + C * 2;
+                    float alpha = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
-                        out_bth[i] += att_btht2 * value_t2[i];
+                        out_bth[i] += alpha * value_t2[i];
                     }
                 }
             }
@@ -196,49 +196,71 @@ void attention_forward(float* out, float* preatt, float* att,
     }
 }
 
+void attention_forward(float* out, float* preatt, float* att, float* inp,
+                                int B, int T, int C, int NH, int nthreads) {
+    attn_args = (struct attn_params){ out, preatt, att, inp, B, T, C, NH, nthreads };
+    for (int i = 0; i < nthreads; i++) create(attention_worker);
+    join();
+}
+
+
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-void gelu_forward(float* out, float* inp, int N) {
-    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
-    for (int i = 0; i < N; i++) {
-        float x = inp[i];
+struct gelu_params { float* out; float* inp; int N; int nthreads; } gelu_args;
+void gelu_worker(int id) {
+    int N = gelu_args.N, n = gelu_args.nthreads;
+    int per = (N + n - 1) / n, start = id * per, end = (start + per > N) ? N : start + per;
+    for (int i = start; i < end; i++) {
+        float x = gelu_args.inp[i];
         float cube = 0.044715f * x * x * x;
-        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
+        gelu_args.out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
-
-void residual_forward(float* out, float* inp1, float* inp2, int N) {
-    for (int i = 0; i < N; i++) {
-        out[i] = inp1[i] + inp2[i];
-    }
+void gelu_forward(float* out, float* inp, int N, int nthreads) {
+    gelu_args = (struct gelu_params){ out, inp, N, nthreads };
+    for (int i = 0; i < nthreads; i++) create(gelu_worker);
+    join();
 }
 
-void softmax_forward(float* probs, float* logits, int B, int T, int V) {
-    // output: probs are (B,T,V) of the probabilities (sums to 1.0 in each b,t position)
-    // input: logits is (B,T,V) of the unnormalized log probabilities
-    for (int b = 0; b < B; b++) {
+
+struct residual_params { float* out; float* in1; float* in2; int N; int nthreads; } res_args;
+void residual_worker(int id) {
+    int N = res_args.N, n = res_args.nthreads;
+    int per = (N + n - 1) / n, start = id * per, end = (start + per > N) ? N : start + per;
+    for (int i = start; i < end; i++) res_args.out[i] = res_args.in1[i] + res_args.in2[i];
+}
+void residual_forward(float* out, float* in1, float* in2, int N, int nthreads) {
+    res_args = (struct residual_params){ out, in1, in2, N, nthreads };
+    for (int i = 0; i < nthreads; i++) create(residual_worker);
+    join();
+}
+
+
+struct softmax_params { float* probs; float* logits; int B, T, V, nthreads; } softmax_args;
+void softmax_worker(int id) {
+    int B = softmax_args.B, T = softmax_args.T, V = softmax_args.V, n = softmax_args.nthreads;
+    int b_per = (B + n - 1) / n, b_start = id * b_per, b_end = (b_start + b_per > B) ? B : b_start + b_per;
+
+    for (int b = b_start; b < b_end; b++) {
         for (int t = 0; t < T; t++) {
-            // probs <- softmax(logits)
-            float* logits_bt = logits + b * T * V + t * V;
-            float* probs_bt = probs + b * T * V + t * V;
-
-            // maxval is only calculated and subtracted for numerical stability
-            float maxval = -10000.0f; // TODO something better
-            for (int i = 0; i < V; i++) {
-                if (logits_bt[i] > maxval) {
-                    maxval = logits_bt[i];
-                }
-            }
+            float* logits_bt = softmax_args.logits + b * T * V + t * V;
+            float* probs_bt = softmax_args.probs + b * T * V + t * V;
+            float maxval = -10000.0f;
+            for (int i = 0; i < V; i++) if (logits_bt[i] > maxval) maxval = logits_bt[i];
             float sum = 0.0f;
             for (int i = 0; i < V; i++) {
                 probs_bt[i] = expf(logits_bt[i] - maxval);
                 sum += probs_bt[i];
             }
-            for (int i = 0; i < V; i++) {
-                probs_bt[i] /= sum;
-            }
+            for (int i = 0; i < V; i++) probs_bt[i] /= sum;
         }
     }
 }
+void softmax_forward(float* probs, float* logits, int B, int T, int V, int nthreads) {
+    softmax_args = (struct softmax_params){ probs, logits, B, T, V, nthreads };
+    for (int i = 0; i < nthreads; i++) create(softmax_worker);
+    join();
+}
+
 
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
@@ -490,7 +512,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
-    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C, model->config.num_threads); // encoding goes into residual[0]
     for (int l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -528,22 +550,23 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, model->config.num_threads);
+        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, model->config.num_threads);
+        attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH, model->config.num_threads);
+        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, model->config.num_threads);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C, model->config.num_threads);
+        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, model->config.num_threads);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, model->config.num_threads);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, model->config.num_threads);
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, model->config.num_threads);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C, model->config.num_threads);
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
-    softmax_forward(acts.probs, acts.logits, B, T, V);
+    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C, model->config.num_threads);
+    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V, model->config.num_threads);
+    softmax_forward(acts.probs, acts.logits, B, T, V, model->config.num_threads);
 }
+
 
 void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
