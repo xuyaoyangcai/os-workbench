@@ -103,9 +103,16 @@ int main() {
         char code[MAX_SRC_LEN] = "#include <stdio.h>\n";
         strncat(code, global_funcs, sizeof(code) - strlen(code) - 1);
 
-        char wrapper[1024];
-        snprintf(wrapper, sizeof(wrapper),
-                 "int %s() { return %s; }\n", func_name, line);
+        char wrapper[1024] = {0};
+        snprintf(wrapper, sizeof(wrapper), "int %s() { return ", func_name);
+
+// 剩余空间计算
+        size_t used = strlen(wrapper);
+        size_t remaining = sizeof(wrapper) - used - 4; // 留出空间给 `; }\n` 和终止符
+
+        strncat(wrapper, line, remaining);
+        strncat(wrapper, "; }\n", sizeof(wrapper) - strlen(wrapper) - 1);
+
 
         strncat(code, wrapper, sizeof(code) - strlen(code) - 1);
 
