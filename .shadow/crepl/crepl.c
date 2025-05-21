@@ -12,6 +12,12 @@
 #define LIB_FILE  "/tmp/libcrepl.so"
 #define MAX_LINE 4096
 
+#ifdef DEBUG
+#define DBG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DBG(fmt, ...)
+#endif
+
 // 去除字符串前后空白
 char* strip(char* s) {
     while (isspace((unsigned char)*s)) s++;
@@ -22,26 +28,30 @@ char* strip(char* s) {
     return s;
 }
 
-// 计算数字字符串长度（十进制）
-int int_len(int n) {
-    int len = 0;
-    if (n == 0) return 1;
-    if (n < 0) { len++; n = -n; }
-    while (n) {
-        n /= 10;
-        len++;
+// 生成gcc编译参数，根据编译位数自动传入 -m32 或 -m64
+// 这里用 sizeof(void*) 判断当前编译是32位还是64位
+void get_gcc_args(char *args[], int *argc) {
+    static char mflag[4];
+    if (sizeof(void*) == 8) {
+        strcpy(mflag, "-m64");
+    } else {
+        strcpy(mflag, "-m32");
     }
-    return len;
+    args[0] = "gcc";
+    args[1] = mflag;
+    args[2] = "-fPIC";
+    args[3] = "-shared";
+    args[4] = CODE_FILE;
+    args[5] = "-o";
+    args[6] = LIB_FILE;
+    args[7] = NULL;
+    *argc = 7;
 }
 
 int main() {
     char line[MAX_LINE];
     char all_funcs[16384] = "";  // 存放所有已定义函数
     int expr_count = 0;
-
-    // 从环境变量读取编译架构，默认-m64
-    const char *arch = getenv("CREPL_ARCH");
-    if (!arch) arch = "-m64";
 
     while (1) {
         printf("crepl> ");
@@ -96,16 +106,15 @@ int main() {
             exit(EXIT_FAILURE);
         } else if (pid == 0) {
             // 子进程执行编译
-            char *argv[] = {
-                    "gcc",
-                    (char *)arch,
-                    "-fPIC",
-                    "-shared",
-                    CODE_FILE,
-                    "-o",
-                    LIB_FILE,
-                    NULL
-            };
+            char *argv[8];
+            int argc = 0;
+            get_gcc_args(argv, &argc);
+
+            DBG("gcc args:");
+            for (int i = 0; i < argc; i++) {
+                DBG("  argv[%d] = %s", i, argv[i]);
+            }
+
             execvp("gcc", argv);
             perror("execvp");
             exit(EXIT_FAILURE);
@@ -118,16 +127,13 @@ int main() {
             }
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
                 printf("compile error\n");
+                // 表达式计数回退，避免跳号
                 if (is_expr) expr_count--;
                 continue;
             }
         }
 
         if (is_expr) {
-            // 调试打印
-            printf("[debug] Calling wrapper function: %s\n", func_name);
-            printf("[debug] Expression: %s\n", actual_line);
-
             // 加载共享库，调用wrapper函数
             void* handle = dlopen(LIB_FILE, RTLD_LAZY);
             if (!handle) {
@@ -135,15 +141,12 @@ int main() {
                 exit(EXIT_FAILURE);
             }
 
-            void *sym = dlsym(handle, func_name);
-            if (!sym) {
+            int (*func)() = dlsym(handle, func_name);
+            if (!func) {
                 fprintf(stderr, "dlsym error: %s\n", dlerror());
                 dlclose(handle);
                 exit(EXIT_FAILURE);
             }
-
-            // 安全转换函数指针
-            int (*func)() = (int (*)())sym;
 
             int result = func();
             printf("%d\n", result);
