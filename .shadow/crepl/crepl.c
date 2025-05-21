@@ -1,107 +1,117 @@
-// crepl.c
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <dlfcn.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
-#define MAX_SRC_LEN 8192
+#define MAX_LINE_LEN 1024
+#define MAX_FUNC_LEN 8192
+#define MAX_SRC_LEN 16384
+#define TMP_FILE "/tmp/crepl_temp.c"
+#define TMP_SO "/tmp/crepl_temp.so"
 
-int expr_counter = 0;
-char global_funcs[MAX_SRC_LEN] = "";  // 用于存储所有历史定义的函数
+// 存储用户定义的所有函数（追加到每次代码片段中）
+char global_funcs[MAX_FUNC_LEN] = "";
 
-// 写入源代码文件
-void write_source_file(const char *filename, const char *code) {
-    FILE *fp = fopen(filename, "w");
+int compile_code(const char *code, const char *func_name) {
+    // 写入临时 C 文件
+    FILE *fp = fopen(TMP_FILE, "w");
     if (!fp) {
         perror("fopen");
-        exit(1);
+        return -1;
     }
-    fprintf(fp, "%s\n", code);
+    fprintf(fp, "%s", code);
     fclose(fp);
-}
 
-// 编译为 .so 动态库
-void compile_shared_object(const char *src, const char *so) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        execlp("gcc", "gcc", "-fPIC", "-shared", "-o", so, src, NULL);
-        perror("execlp");
-        exit(1);
-    }
-    int status;
-    waitpid(pid, &status, 0);
+    // 构造 gcc 命令，编译为共享库
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "gcc -shared -fPIC -o %s %s -Wall -Wextra -Wno-unused-result -Wno-format-truncation",
+             TMP_SO, TMP_FILE);
+
+    int status = system(cmd);
     if (status != 0) {
-        fprintf(stderr, "Compilation failed.\n");
+        fprintf(stderr, "Compilation failed\n");
+        return -1;
     }
+
+    return 0;
 }
 
-// 执行表达式函数
-void run_expr_function(const char *so_path, const char *func_name) {
-    void *handle = dlopen(so_path, RTLD_NOW);
+int call_func(const char *func_name) {
+    void *handle = dlopen(TMP_SO, RTLD_NOW);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
-        return;
+        return -1;
     }
 
-    int (*func)() = dlsym(handle, func_name);
-    if (!func) {
-        fprintf(stderr, "dlsym error: %s\n", dlerror());
+    // 清除旧的错误
+    dlerror();
+    int (*fptr)() = (int (*)())dlsym(handle, func_name);
+    char *error = dlerror();
+    if (error != NULL) {
+        fprintf(stderr, "dlsym error: %s\n", error);
         dlclose(handle);
-        return;
+        return -1;
     }
 
-    int result = func();
-    printf("= %d\n", result);
+    int ret = fptr();
+    printf("=> %d\n", ret);
+
     dlclose(handle);
+    return 0;
+}
+
+int is_func_definition(const char *line) {
+    return strncmp(line, "int ", 4) == 0 && strchr(line, '(') && strchr(line, ')') && strchr(line, '{');
 }
 
 int main() {
-    char line[1024];
+    char line[MAX_LINE_LEN];
 
-    printf("crepl> ");
-    while (fgets(line, sizeof(line), stdin)) {
-        if (strncmp(line, "int ", 4) == 0) {
-            // 函数定义
-            strncat(global_funcs, line, sizeof(global_funcs) - strlen(global_funcs) - 1);
-            printf("OK.\n");
-        } else {
-            // 表达式处理
-            expr_counter++;
-            char func_name[64];
-            sprintf(func_name, "__expr_wrapper_%d", expr_counter);
+    printf("Welcome to crepl (C REPL)\n");
 
-            char code[MAX_SRC_LEN];
-            snprintf(code, sizeof(code),
-                     "#include <stdio.h>\n"
-                     "%s\n" // 所有已定义的函数
-                     "int %s() { return %s; }\n",
-                     global_funcs, func_name, line);
+    while (1) {
+        printf(">>> ");
+        fflush(stdout);
 
-            // 创建源文件和 .so 文件路径
-            char src_path[] = "/tmp/crepl_src_XXXXXX.c";
-            int src_fd = mkstemps(src_path, 2);  // 后缀 .c
-            if (src_fd == -1) {
-                perror("mkstemps");
-                continue;
-            }
-            close(src_fd);  // 会用 fopen 写入
+        if (!fgets(line, sizeof(line), stdin)) break;
 
-            char so_path[256];
-            snprintf(so_path, sizeof(so_path), "%.*s.so", (int)(strlen(src_path) - 2), src_path);
+        // 去掉换行符
+        line[strcspn(line, "\n")] = '\0';
 
-            write_source_file(src_path, code);
-            compile_shared_object(src_path, so_path);
-            run_expr_function(so_path, func_name);
+        if (strlen(line) == 0) continue;
 
-            unlink(src_path);
-            unlink(so_path);
+        if (strcmp(line, ":quit") == 0 || strcmp(line, ":q") == 0) break;
+
+        if (is_func_definition(line)) {
+            // 累加函数定义
+            strncat(global_funcs, line, sizeof(global_funcs) - strlen(global_funcs) - 2);
+            strncat(global_funcs, "\n", sizeof(global_funcs) - strlen(global_funcs) - 1);
+            printf("[function stored]\n");
+            continue;
         }
 
-        printf("crepl> ");
+        // 为表达式包装函数
+        static int counter = 0;
+        char func_name[64];
+        snprintf(func_name, sizeof(func_name), "__expr_wrapper_%d", counter++);
+
+        char code[MAX_SRC_LEN] = "#include <stdio.h>\n";
+        strncat(code, global_funcs, sizeof(code) - strlen(code) - 1);
+
+        char wrapper[1024];
+        snprintf(wrapper, sizeof(wrapper),
+                 "int %s() { return %s; }\n", func_name, line);
+
+        strncat(code, wrapper, sizeof(code) - strlen(code) - 1);
+
+        if (compile_code(code, func_name) == 0) {
+            call_func(func_name);
+        }
     }
 
     return 0;
