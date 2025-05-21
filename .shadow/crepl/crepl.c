@@ -2,113 +2,134 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
+#include <unistd.h>
 #include <sys/wait.h>
 #include <dlfcn.h>
 #include <ctype.h>
-#include <fcntl.h>
 
-#define MAX_LINE_LEN 1024
 #define CODE_FILE "/tmp/crepl_code.c"
-#define SO_FILE "/tmp/crepl_code.so"
+#define LIB_FILE  "/tmp/libcrepl.so"
+#define MAX_LINE 4096
 
-static int expr_count = 0;
-
-// 去除前后空白
-char* strip(char* line) {
-    while (isspace(*line)) line++;
-    char* end = line + strlen(line) - 1;
-    while (end > line && isspace(*end)) *end-- = '\0';
-    return line;
-}
-
-// 写入函数或表达式包装器到 C 文件中
-void write_code_to_file(const char* code, int is_expr, const char* func_name) {
-    FILE* fp = fopen(CODE_FILE, "a+");
-    if (!fp) {
-        perror("fopen");
-        exit(EXIT_FAILURE);
-    }
-
-    if (is_expr) {
-        fprintf(fp, "int %s() { return %s; }\n", func_name, code);
-    } else {
-        fprintf(fp, "%s\n", code);
-    }
-
-    fclose(fp);
-}
-
-// 编译 crepl_code.c 为共享库
-int compile_code() {
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        exit(EXIT_FAILURE);
-    } else if (pid == 0) {
-        char* argv[] = {
-                "gcc", "-fPIC", "-shared", CODE_FILE,
-                "-o", SO_FILE, NULL
-        };
-        execve("/usr/bin/gcc", argv, environ);
-        perror("execve");
-        exit(1);
-    } else {
-        int status;
-        waitpid(pid, &status, 0);
-        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    }
+// 去除字符串前后空白
+char* strip(char* s) {
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == 0) return s;
+    char* end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) end--;
+    *(end + 1) = '\0';
+    return s;
 }
 
 int main() {
-    char line_buf[MAX_LINE_LEN];
-    char func_name[64];
-    FILE* fclear = fopen(CODE_FILE, "w");
-    if (fclear) fclose(fclear);  // 清空文件
+    char line[MAX_LINE];
+    char all_funcs[16384] = "";  // 存放所有已定义函数
+    int expr_count = 0;
 
     while (1) {
         printf("crepl> ");
         fflush(stdout);
 
-        if (!fgets(line_buf, sizeof(line_buf), stdin)) break;
+        if (!fgets(line, sizeof(line), stdin)) {
+            break;
+        }
 
-        char* line = strip(line_buf);
-        if (strlen(line) == 0) continue;
+        char* actual_line = strip(line);
+        if (actual_line[0] == '\0') {
+            continue;  // 空行跳过
+        }
 
-        int is_expr = strncmp(line, "int ", 4) != 0;
+        int is_expr = 0;
+        char func_name[64] = {0};
 
-        if (is_expr) {
-            snprintf(func_name, sizeof(func_name), "__expr_wrapper_%d", expr_count++);
-            write_code_to_file(line, 1, func_name);
+        if (strncmp(actual_line, "int ", 4) == 0) {
+            // 函数定义，累积保存
+            if (strlen(all_funcs) + strlen(actual_line) + 2 < sizeof(all_funcs)) {
+                strcat(all_funcs, actual_line);
+                strcat(all_funcs, "\n");
+            } else {
+                fprintf(stderr, "Error: too much code accumulated\n");
+                exit(EXIT_FAILURE);
+            }
         } else {
-            write_code_to_file(line, 0, NULL);
+            // 表达式，生成wrapper函数名
+            is_expr = 1;
+            snprintf(func_name, sizeof(func_name), "__expr_wrapper_%d", expr_count++);
         }
 
-        if (!compile_code()) {
-            printf("Compile error.\n");
-            continue;
+        // 写入临时文件：所有已定义函数 + 当前表达式wrapper（如果有）
+        FILE* fp = fopen(CODE_FILE, "w");
+        if (!fp) {
+            fprintf(stderr, "fopen error: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+
+        fputs("#include <stdio.h>\n", fp);
+        fputs(all_funcs, fp);
+
+        if (is_expr) {
+            fprintf(fp, "int %s() { return %s; }\n", func_name, actual_line);
+        }
+        fclose(fp);
+
+        // fork + exec gcc 编译共享库
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        } else if (pid == 0) {
+            // 子进程执行编译
+            char *argv[] = {
+                    "gcc",
+                    "-fPIC",
+                    "-shared",
+                    CODE_FILE,
+                    "-o",
+                    LIB_FILE,
+                    NULL
+            };
+            execvp("gcc", argv);
+            perror("execvp");
+            exit(EXIT_FAILURE);
+        } else {
+            // 父进程等待编译结束
+            int status;
+            if (waitpid(pid, &status, 0) == -1) {
+                perror("waitpid");
+                exit(EXIT_FAILURE);
+            }
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                printf("compile error\n");
+                // 表达式计数回退，避免跳号
+                if (is_expr) expr_count--;
+                continue;
+            }
         }
 
         if (is_expr) {
-            void* handle = dlopen(SO_FILE, RTLD_NOW);
+            // 加载共享库，调用wrapper函数
+            void* handle = dlopen(LIB_FILE, RTLD_LAZY);
             if (!handle) {
                 fprintf(stderr, "dlopen error: %s\n", dlerror());
-                continue;
+                exit(EXIT_FAILURE);
             }
 
-            int (*expr_func)() = dlsym(handle, func_name);
-            if (!expr_func) {
+            int (*func)() = dlsym(handle, func_name);
+            if (!func) {
                 fprintf(stderr, "dlsym error: %s\n", dlerror());
                 dlclose(handle);
-                continue;
+                exit(EXIT_FAILURE);
             }
 
-            int result = expr_func();
+            int result = func();
             printf("%d\n", result);
+            fflush(stdout);
+
             dlclose(handle);
         } else {
             printf("ok\n");
+            fflush(stdout);
         }
     }
 
