@@ -12,12 +12,6 @@
 #define LIB_FILE  "/tmp/libcrepl.so"
 #define MAX_LINE 4096
 
-#ifdef DEBUG
-#define DBG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
-#else
-#define DBG(fmt, ...)
-#endif
-
 // 去除字符串前后空白
 char* strip(char* s) {
     while (isspace((unsigned char)*s)) s++;
@@ -28,22 +22,18 @@ char* strip(char* s) {
     return s;
 }
 
-// 生成gcc编译参数，根据编译位数自动传入 -m32 或 -m64
-// 这里用 sizeof(void*) 判断当前编译是32位还是64位
+// 根据当前环境获取gcc编译参数
 void get_gcc_args(char *args[], int *argc) {
-    static char mflag[4];
-    if (sizeof(void*) == 8) {
-        strcpy(mflag, "-m64");
-    } else {
-        strcpy(mflag, "-m32");
-    }
+    // 改成指向常量字符串，避免数组溢出警告
+    static const char *mflag = (sizeof(void*) == 8) ? "-m64" : "-m32";
+
     args[0] = "gcc";
-    args[1] = mflag;
+    args[1] = (char *)mflag;
     args[2] = "-fPIC";
     args[3] = "-shared";
-    args[4] = CODE_FILE;
+    args[4] = (char *)CODE_FILE;
     args[5] = "-o";
-    args[6] = LIB_FILE;
+    args[6] = (char *)LIB_FILE;
     args[7] = NULL;
     *argc = 7;
 }
@@ -107,14 +97,8 @@ int main() {
         } else if (pid == 0) {
             // 子进程执行编译
             char *argv[8];
-            int argc = 0;
+            int argc;
             get_gcc_args(argv, &argc);
-
-            DBG("gcc args:");
-            for (int i = 0; i < argc; i++) {
-                DBG("  argv[%d] = %s", i, argv[i]);
-            }
-
             execvp("gcc", argv);
             perror("execvp");
             exit(EXIT_FAILURE);
