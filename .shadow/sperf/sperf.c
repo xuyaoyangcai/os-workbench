@@ -1,196 +1,115 @@
-#define _GNU_SOURCE // for memfd_create
 
-#include <assert.h>
-#include <regex.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <fcntl.h>
+#include <string.h>
+#include <malloc.h>
+#include <assert.h>
+#define zassert(x, s) \
+	do { if ((x) == 0) { printf("%s\n", s); assert((x)); } } while (0)
 
-extern char **environ;
-
-typedef struct {
-    char name[64];
+char buf[BUFSIZ];
+struct info {
+    char name[100];
     double time;
-} SyscallLog;
-
-typedef struct {
-    SyscallLog* logs;
-    int count;
-    int capacity;
-} SyscallStats;
-
-SyscallLog* extract(char* line, regex_t* reg)
-{
-    regmatch_t matches[3];
-    int len;
-    static SyscallLog log;
-
-    if (regexec(reg, line, 3, matches, 0) == 0) {
-        len = matches[1].rm_eo - matches[1].rm_so;
-        strncpy(log.name, line + matches[1].rm_so, len);
-        log.name[len] = '\0';
-
-        len = matches[2].rm_eo - matches[2].rm_so;
-        char time_str[16];
-        strncpy(time_str, line + matches[2].rm_so, len);
-        time_str[len] = '\0';
-        log.time = atof(time_str);
-
-        return &log;
-    } else {
-        return NULL;
-    }
-}
-
-int update_stats(SyscallLog* log, SyscallStats* stats)
-{
-    for (int i = 0; i < stats->count; i++) {
-        if (strcmp(stats->logs[i].name, log->name) == 0) {
-            stats->logs[i].time += log->time;
-            return 0;
+    struct info *next;
+};
+struct info *syscall_info = NULL;
+void add(double time, char *name) {
+    for (struct info *i = syscall_info; i != NULL; i = i->next) {
+        if (strcmp(i->name, name) == 0) {
+            i->time += time;
+            return;
         }
     }
-
-    if (stats->count == stats->capacity) {
-        stats->capacity = stats->capacity == 0 ? 10 : stats->capacity * 2;
-        stats->logs = realloc(stats->logs, stats->capacity * sizeof(SyscallLog));
-        assert(stats->logs != NULL);
-    }
-
-    memcpy(&stats->logs[stats->count], log, sizeof(SyscallLog));
-    stats->count++;
-
-    return 0;
+    struct info *si = (struct info *)malloc(sizeof(struct info));
+    strcpy(si->name, name);
+    si->time = time;
+    si->next = syscall_info;
+    /* printf("-- %lf %s\n", si->time, si->name); */
+    syscall_info = si;
 }
 
-int compare(const void* a, const void* b)
-{
-    double diff = ((SyscallLog*)b)->time - ((SyscallLog*)a)->time;
-    return diff > 0 ? 1 : -1;
-}
+int main(int argc, char *argv[], char *envp[]) {
+    zassert(argc >= 2, "need at least one argument");
 
-int output(SyscallStats* stats, bool is_end)
-{
-    qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
+    char *strace_argv[] = { "strace", "-r", argv[1], NULL };
+    int pipefd[2];
+    int pid;
 
-    double total = 0;
-    for (int i = 0; i < stats->count; i++) {
-        total += stats->logs[i].time;
-    }
+    zassert(pipe(pipefd) == 0, "create pipe failed");
 
-    printf("Total: %fs\n", total);
-    for (int i = 0; i < stats->count; i++) {
-        int ratio = stats->logs[i].time / total * 100;
-        printf("%s (%d%%)\n", stats->logs[i].name, ratio);
-        if (i == 4) {
-            printf("...\n");
-            break;
-        }
-    }
-
-    for (int i = 0; i < 80; i++) {
-        putchar('\0');
-    }
-    if (!is_end) {
-        printf("====================\n");
-    }
-
-    fflush(stdout);
-    return 0;
-}
-
-void child_process(int pfd[], int argc, char* argv[])
-{
-    int memfd = memfd_create("strace_output", MFD_CLOEXEC);
-    assert(memfd != -1);
-    char memfd_path[64];
-    snprintf(memfd_path, sizeof(memfd_path), "/proc/self/fd/%d", memfd);
-
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-
-    close(pfd[0]);
-    int dpr = dup2(pfd[1], memfd);
-    assert(dpr != -1);
-    close(pfd[1]);
-
-    char* exec_argv[argc + 4];
-    exec_argv[0] = "strace";
-    exec_argv[1] = "-T";
-    exec_argv[2] = "-o";
-    exec_argv[3] = memfd_path;
-    for (int i = 1; i < argc; i++) {
-        exec_argv[i + 3] = argv[i];
-    }
-    exec_argv[argc + 3] = NULL;
-
-    char path_str[1024] = "PATH=";
-    strncat(path_str, getenv("PATH"), sizeof(path_str) - 5);
-    char* exec_envp[] = { path_str, NULL };
-
-    execve("/usr/bin/strace", exec_argv, exec_envp);
-    assert(false);
-}
-
-void parent_process(int pfd[])
-{
-    close(pfd[1]);
-    FILE* pipe_fp = fdopen(pfd[0], "r");
-    assert(pipe_fp != NULL);
-
-    SyscallStats stats = { NULL, 0, 0 };
-    char* line = NULL;
-    size_t len = 0;
-    clock_t prev = clock();
-
-    regex_t reg;
-    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\n$";
-    int rc = regcomp(&reg, pattern, REG_EXTENDED);
-    assert(rc == 0);
-
-    while (getline(&line, &len, pipe_fp) != -1) {
-        SyscallLog* log = extract(line, &reg);
-        if (log == NULL) continue;
-        update_stats(log, &stats);
-
-        clock_t now = clock();
-        if ((now - prev) * 1000 / CLOCKS_PER_SEC > 100) {
-            prev = now;
-            output(&stats, false);
-        }
-    }
-    output(&stats, true);
-
-    free(line);
-    free(stats.logs);
-    regfree(&reg);
-    fclose(pipe_fp);
-}
-
-int main(int argc, char* argv[])
-{
-    if (argc == 1) {
-        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
-        while (1) pause(); // 不退出，避免“Wrong Answer”
-    }
-
-    int pfd[2];
-    assert(pipe(pfd) == 0);
-
-    pid_t pid = fork();
-    assert(pid != -1);
-
+    pid = fork();
     if (pid == 0) {
-        child_process(pfd, argc, argv);
-    } else {
-        parent_process(pfd);
+        // 关闭stderr
+        close(2);
+        // 将stderr接到管道的输入，stderr将输出到管道的输入
+        dup2(pipefd[1], 2);
+        close(pipefd[1]);
+        // 关闭stdout（比如ls，会输出到stdout）
+        close(1);
+        // 关闭管道输出，用不到
+        close(pipefd[0]);
+
+        execve("/bin/strace", strace_argv, envp);
+        zassert(0, "execve failed");
+    }
+    else {
+        // 关掉父进程的管道输入，不然管道输出会阻塞
+        close(pipefd[1]);
+        double time;
+        char name[100];
+
+        while (fgets(buf, sizeof(buf), fdopen(pipefd[0], "r"))) {
+            /* printf("%s", buf); */
+            sscanf(buf, "%lf %s", &time, name);
+            if (name[0] == '+') { continue; }
+
+            for (int i = 0; name[i]; i ++ ) {
+                if (name[i] == '(') {
+                    name[i] = '\0';
+                    break;
+                }
+            }
+            add(time, name);
+            /* printf("%lf %s\n", time, name); */
+        }
     }
 
-    return 0;
+    double total = 0, others = 0;
+    struct info syscall_sort[5] = { };
+
+    for (struct info *i = syscall_info; i != NULL; i = i->next) {
+        for (int j = 0; j < 4; j++) {
+            if (syscall_sort[j].time < i->time) {
+                for (int k = 2; k >= j; k--) {
+                    syscall_sort[k + 1] = syscall_sort[k];
+                }
+                syscall_sort[j] = *i;
+                break;
+            }
+        }
+        total += i->time;
+        /* printf("%s (%lf)\n", i->time, i->name); */
+        /* fflush(stdout); */
+    }
+
+    others = total;
+    for (int i = 0; i < 5; i++) {
+        if (syscall_sort[i].time > 0) {
+            printf("%s (%lf%%)\n", syscall_sort[i].name, syscall_sort[i].time / total);
+            fflush(stdout);
+            others -= syscall_sort[i].time;
+        }
+        else {
+            printf("%s (%lf%%)\n", "others", others / total);
+            fflush(stdout);
+        }
+    }
+
+    for (struct info *i = syscall_info; i != NULL; ) {
+        struct info *j = i;
+        i = i->next;
+        free(j);
+    }
 }
