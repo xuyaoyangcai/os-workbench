@@ -1,15 +1,12 @@
-#define _GNU_SOURCE
-#include <assert.h>
-#include <regex.h>
-#include <stdbool.h>
 #include <stdio.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
+#include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <sys/time.h>
 
 extern char **environ;
 
@@ -45,7 +42,7 @@ int compare_syscall_stats(const void *a, const void *b)
     return 0;
 }
 
-// 解析一行 strace 输出，提取系统调用名称和时间
+// 解析一行strace输出，提取系统调用名称和时间
 int parse_strace_line(char *line, char *name, double *time)
 {
     char *time_start = strstr(line, "<");
@@ -117,119 +114,19 @@ void print_stats()
     // 排序
     qsort(stats, syscall_count, sizeof(SyscallStat), compare_syscall_stats);
 
-    // 输出前 TOP_N 个
+    // 输出前TOP_N个
     int limit = (syscall_count < TOP_N) ? syscall_count : TOP_N;
     for (int i = 0; i < limit; i++)
     {
         printf("%s (%d%%)\n", stats[i].name, (int)(stats[i].percentage + 0.5));
     }
 
-    // 输出 80 个 '\0' 作为分隔符
+    // 输出80个'\0'作为分隔符
     for (int i = 0; i < 80; i++)
     {
         putchar('\0');
     }
     fflush(stdout);
-}
-
-void child_process(int pfd[], int argc, char *argv[])
-{
-    close(pfd[0]); // 关闭读端
-
-    // 重定向标准错误到管道
-    dup2(pfd[1], STDERR_FILENO);
-    close(pfd[1]);
-
-    // 构建 strace 命令行参数
-    char **strace_args = (char **)malloc((argc + 3) * sizeof(char *));
-    strace_args[0] = "strace";
-    strace_args[1] = "-T"; // 显示系统调用时间
-
-    // 复制用户命令及参数
-    for (int i = 1; i < argc; i++)
-    {
-        strace_args[i + 1] = argv[i];
-    }
-    strace_args[argc + 2] = NULL;
-
-    // 尝试执行 strace，查找可能的路径
-    char *paths[] = {
-            "/bin/strace",
-            "/usr/bin/strace",
-            "/usr/local/bin/strace",
-            NULL};
-
-    for (char **path = paths; *path; path++)
-    {
-        execve(*path, strace_args, environ);
-    }
-
-    // 如果执行到这里，说明 execve 都失败了
-    perror("execve strace");
-    exit(1);
-}
-
-void parent_process(int pfd[])
-{
-    close(pfd[1]); // 关闭写端
-
-    char buffer[4096];
-    char line[1024] = {0};
-    int line_pos = 0;
-
-    // 读取 strace 输出
-    while (1)
-    {
-        // 检查子进程是否结束
-        int status;
-        pid_t w = waitpid(-1, &status, WNOHANG);
-        if (w > 0)
-        {
-            // 子进程已结束，打印最后的统计信息
-            print_stats();
-            break;
-        }
-
-        // 尝试从管道读取数据
-        int n = read(pfd[0], buffer, sizeof(buffer) - 1);
-        if (n > 0)
-        {
-            buffer[n] = '\0';
-
-            // 处理读取到的数据
-            for (int i = 0; i < n; i++)
-            {
-                if (buffer[i] == '\n')
-                {
-                    // 行结束，解析该行
-                    line[line_pos] = '\0';
-
-                    char syscall_name[32];
-                    double syscall_time;
-
-                    if (parse_strace_line(line, syscall_name, &syscall_time))
-                    {
-                        int idx = find_or_create_stat(syscall_name);
-                        if (idx >= 0)
-                        {
-                            stats[idx].total_time += syscall_time;
-                        }
-                    }
-
-                    line_pos = 0;
-                }
-                else if (line_pos < sizeof(line) - 1)
-                {
-                    // 继续构建当前行
-                    line[line_pos++] = buffer[i];
-                }
-            }
-        }
-
-        usleep(1000); // 减少休眠时间，提高响应速度
-    }
-
-    close(pfd[0]);
 }
 
 int main(int argc, char *argv[])
@@ -260,12 +157,121 @@ int main(int argc, char *argv[])
     if (pid == 0)
     {
         // 子进程
-        child_process(pipefd, argc, argv);
+        close(pipefd[0]); // 关闭读端
+
+        // 重定向标准错误到管道
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        // 构建strace命令行参数
+        char **strace_args = (char **)malloc((argc + 3) * sizeof(char *));
+        strace_args[0] = "strace";
+        strace_args[1] = "-T"; // 显示系统调用时间
+
+        // 复制用户命令及参数
+        for (int i = 1; i < argc; i++)
+        {
+            strace_args[i + 1] = argv[i];
+        }
+        strace_args[argc + 2] = NULL;
+
+        // 尝试执行strace，查找可能的路径
+        char *paths[] = {
+                "/bin/strace",
+                "/usr/bin/strace",
+                "/usr/local/bin/strace",
+                NULL};
+
+        for (char **path = paths; *path; path++)
+        {
+            execve(*path, strace_args, environ);
+        }
+
+        // 如果执行到这里，说明execve都失败了
+        perror("execve strace");
+        exit(1);
     }
     else
     {
         // 父进程
-        parent_process(pipefd);
+        close(pipefd[1]); // 关闭写端
+
+        // 将管道设置为非阻塞模式
+        fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+
+        struct timeval last_print_time, current_time;
+        gettimeofday(&last_print_time, NULL);
+
+        char buffer[4096];
+        char line[1024] = {0};
+        int line_pos = 0;
+
+        // 读取strace输出
+        while (1)
+        {
+            // 检查子进程是否结束
+            int status;
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w > 0)
+            {
+                // 子进程已结束，打印最后的统计信息
+                print_stats();
+                break;
+            }
+
+            // 尝试从管道读取数据
+            int n = read(pipefd[0], buffer, sizeof(buffer) - 1);
+            if (n > 0)
+            {
+                buffer[n] = '\0';
+
+                // 处理读取到的数据
+                for (int i = 0; i < n; i++)
+                {
+                    if (buffer[i] == '\n')
+                    {
+                        // 行结束，解析该行
+                        line[line_pos] = '\0';
+
+                        char syscall_name[32];
+                        double syscall_time;
+
+                        if (parse_strace_line(line, syscall_name, &syscall_time))
+                        {
+                            int idx = find_or_create_stat(syscall_name);
+                            if (idx >= 0)
+                            {
+                                stats[idx].total_time += syscall_time;
+                            }
+                        }
+
+                        line_pos = 0;
+                    }
+                    else if (line_pos < sizeof(line) - 1)
+                    {
+                        // 继续构建当前行
+                        line[line_pos++] = buffer[i];
+                    }
+                }
+            }
+
+            // 检查是否需要输出统计信息
+            gettimeofday(&current_time, NULL);
+            double elapsed = (current_time.tv_sec - last_print_time.tv_sec) * 1000.0 +
+                             (current_time.tv_usec - last_print_time.tv_usec) / 1000.0;
+
+            if (elapsed >= 10) // 减少等待时间从100ms到10ms，更频繁地检查和输出
+            {
+                print_stats();
+                last_print_time = current_time;
+            }
+
+            usleep(1000); // 减少休眠时间，提高响应速度
+        }
+
+        // 确保子进程结束时输出最终统计
+        print_stats();
+        close(pipefd[0]);
     }
 
     return 0;
