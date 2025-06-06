@@ -34,7 +34,7 @@ SyscallLog* extract(char* line, regex_t* reg)
 
     if (regexec(reg, line, 3, matches, 0) == 0) {
         len = matches[1].rm_eo - matches[1].rm_so;
-        if (len >= 64) len = 63;
+        if (len >= (int)sizeof(log.name)) len = sizeof(log.name) - 1;
         strncpy(log.name, line + matches[1].rm_so, len);
         log.name[len] = '\0';
 
@@ -63,7 +63,10 @@ int update_stats(SyscallLog* log, SyscallStats* stats)
     if (stats->count == stats->capacity) {
         stats->capacity = stats->capacity == 0 ? 10 : stats->capacity * 2;
         stats->logs = realloc(stats->logs, stats->capacity * sizeof(SyscallLog));
-        assert(stats->logs != NULL);
+        if (!stats->logs) {
+            perror("realloc");
+            exit(EXIT_FAILURE);
+        }
     }
 
     memcpy(&stats->logs[stats->count], log, sizeof(SyscallLog));
@@ -80,6 +83,8 @@ int compare(const void* a, const void* b)
 
 int output(SyscallStats* stats, bool is_end)
 {
+    if (stats->count == 0) return 0;
+
     qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
 
     double total = 0;
@@ -88,7 +93,7 @@ int output(SyscallStats* stats, bool is_end)
     }
 
     if (total > 0) {
-        printf("Total: %fs\n", total);
+        printf("Total: %.6fs\n", total);
         for (int i = 0; i < stats->count && i < 5; i++) {
             int ratio = (int)(stats->logs[i].time / total * 100);
             printf("%s (%d%%)\n", stats->logs[i].name, ratio);
@@ -109,10 +114,19 @@ int output(SyscallStats* stats, bool is_end)
 void child_process(int pfd[], int argc, char* argv[])
 {
     close(pfd[0]);
-    dup2(pfd[1], STDERR_FILENO);
+    if (dup2(pfd[1], STDERR_FILENO) == -1) {
+        perror("dup2");
+        exit(EXIT_FAILURE);
+    }
     close(pfd[1]);
 
+    // 构造 execvp 参数
     char** exec_argv = malloc((argc + 3) * sizeof(char*));
+    if (!exec_argv) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+
     exec_argv[0] = "strace";
     exec_argv[1] = "-T";
 
@@ -122,14 +136,14 @@ void child_process(int pfd[], int argc, char* argv[])
         }
         exec_argv[argc + 1] = NULL;
     } else {
-        exec_argv[1] = "-T";
         exec_argv[2] = "sleep";
         exec_argv[3] = "1000000000";
         exec_argv[4] = NULL;
     }
 
     execvp("strace", exec_argv);
-    perror("execve");
+
+    perror("execvp");
     free(exec_argv);
     exit(EXIT_FAILURE);
 }
@@ -146,19 +160,24 @@ void parent_process(int pfd[])
     clock_t prev = clock();
 
     regex_t reg;
-    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\n$";
-    int rc = regcomp(&reg, pattern, REG_EXTENDED);
-    assert(rc == 0);
+    // 匹配形式: syscall(...) = ... <time>
+    const char* pattern = "([a-z0-9_]+)\\(.*\\)\\s*=.*<([0-9.]+)>";
+    int rc = regcomp(&reg, pattern, REG_EXTENDED | REG_ICASE);
+    if (rc != 0) {
+        fprintf(stderr, "Failed to compile regex\n");
+        exit(EXIT_FAILURE);
+    }
 
     while (getline(&line, &len, pipe_fp) != -1) {
         SyscallLog* log = extract(line, &reg);
-        if (log == NULL) continue;
-        update_stats(log, &stats);
+        if (log != NULL) {
+            update_stats(log, &stats);
+        }
 
         clock_t now = clock();
-        if ((now - prev) * 1000.0 / CLOCKS_PER_SEC > 100) {
-            prev = now;
+        if ((now - prev) * 1000.0 / CLOCKS_PER_SEC > 1000) { // 1秒刷新
             output(&stats, false);
+            prev = now;
         }
     }
     output(&stats, true);
@@ -172,7 +191,7 @@ void parent_process(int pfd[])
 int main(int argc, char* argv[])
 {
     int pfd[2];
-    if (pipe(pfd) {
+    if (pipe(pfd) != 0) {
         perror("pipe");
         return EXIT_FAILURE;
     }
