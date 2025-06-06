@@ -1,240 +1,154 @@
-
-#include <assert.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <stdbool.h>
-#include <time.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
-#include <signal.h>
-#include <stdint.h>
-#include <sys/ioctl.h>
+#include <assert.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <errno.h>
 
-struct Syscall {
+#define MAX_SYSCALL 1024
+#define BUF_SIZE 512
+
+struct syscallStat {
     char name[64];
     double time;
-    int color;
 };
-struct Syscall info[1024];
-int h_info;
-char tmp[1024], ttmp[1024], name[1024];
-int color_set[] = {41,42,43,44,45,46,47,101};
-#define COLORNUM 7
-int color_p = 0;
-int ws_row, ws_col, ws_ratio;
 
-int loc(char *name)
-{
-    int i;
-    for (i = 0; i < h_info; ++i) {
-        if (strcmp(name, info[i].name) == 0) {
-            break;
-        }
-    }
-    if (i == h_info) {
-        strcpy(info[i].name, name);
-        info[i].color = color_set[color_p];
-        color_p = (color_p + 1)%COLORNUM;
-        h_info++;
-    }
-    return i;
+int cmp(const void *a, const void *b) {
+    double t1 = ((struct syscallStat *)a)->time;
+    double t2 = ((struct syscallStat *)b)->time;
+    return (t1 > t2) ? -1 : (t1 < t2);
 }
 
-#define clear() printf("\e[H\e[J\e[?25l")
-#define show() printf("\e[?25h")
-
-void sort()
-{
-    for (int i = 0; i < h_info; ++i)
-        for (int j = i + 1; j < h_info; ++j)
-            if (info[i].time < info[j].time) {
-                struct Syscall tmp = info[i];
-                info[i] = info[j];
-                info[j] = tmp;
-            }
-}
-
-#define RESET "\e[0m"
-#define move(x,y) printf("\e[%d;%dH", x, y)
-#define draw_rect_label(x,y,s,t,num) draw_rect(x,y,s,t,num); draw_label(x,y,s,t,num)
-double total_time,sum;
-
-void draw_rect(int x, int y, int s, int t, int num){
-    move(x, y);
-    for (int i = 0; i <= s-x; ++i) {
-        move(x + i, y);
-        for (int j = 0; j <= t-y; ++j) {
-            printf("\e[%dm " RESET, info[num].color);
-        }
-        printf("\n");
-    }
-}
-
-void draw_label(int x, int y, int s, int t, int num){
-    int len = strlen(info[num].name);
-    move((s+x)/2, (t+y)/2-len/2);
-    printf("\e[%dm%s" RESET, info[num].color, info[num].name);
-    move((s+x)/2+1, (t+y)/2-4);
-    printf("\e[%dm(%3.2lf%%)" RESET, info[num].color, info[num].time*100/sum);
-    fflush(stdout);
-}
-
-void set_others(){
-    strcpy(info[h_info].name, "others");
-    info[h_info].time = sum - total_time;
-    info[h_info].color = 101;
-}
-
-#define SX 1
-#define SY (SX*ws_ratio)
-#define X (ws_row*4/5)
-#define Y (ws_col*4/5)
-void clear_graph(){
-    move(SX,SY);
-    for (int i=0; i<=X+10; ++i){
-        move(i, 0);
-        for (int j=0; j<=Y+10; ++j)
-            printf(RESET " ");
-    }
-}
-
-void draw_graph()
-{
-    int x = SX;
-    int y = SY;
-    move(x,y);
-    int odd = 0;
-    clear_graph();
-    sum = 0;
-    for (int i = 0; i < h_info; ++i) {
-        sum += info[i].time;
-    }
-    total_time = 0;
-    for (int i=0;i<h_info;++i,odd^=1){
-        if (total_time/sum>0.95) break;
-        total_time += info[i].time;
-        if (!odd){
-            int w = (double)X*Y*info[i].time/sum/(X-x+1);
-            draw_rect_label(x,y,X,y+w-3,i);
-            y += w;
-        } else {
-            int w = (double)X*Y*info[i].time/sum/(Y-y+1);
-            draw_rect_label(x,y,x+w-2,Y,i);
-            x += w;
-        }
-    }
-    set_others();
-    draw_rect_label(x,y,X,Y,h_info);
-}
-
-void draw_table()
-{
-    printf("\e[H");
-    sum = 0;
-    for (int i = 0; i < h_info; ++i) {
-        printf("%s: %10lf\n", info[i].name, info[i].time);
-        sum += info[i].time;
-    }
-    printf("******************\n");
-    printf("total time: %10.5lf\n", sum);
-}
-
-void signal_callback_handler(int signum)
-{
-    move(X+1,Y/2);
-    printf("TERMINATED\n");
-    show();
-    exit(signum);
-}
-
-#ifdef TABLE
-#define draw sort(); draw_table
-#else
-#define draw sort(); draw_graph
-#endif
-
-
-int main(int argc, char *argv[], char *env[])
-{
-    //new argv
-    struct winsize w;
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-    ws_row = w.ws_row;
-    ws_col = w.ws_col;
-    ws_ratio = ws_col/ws_row;
-
-    char *argv_new[argc + 2];
-    argv_new[0] = "/usr/bin/strace";
-    argv_new[1] = "-Txx";
-    for (int i = 1; i < argc; ++i)
-        argv_new[i + 1] = argv[i];
-    argv_new[argc + 1] = NULL;
-    time_t begin = time(NULL);
-    signal(SIGINT, signal_callback_handler);
-
-    int flides[2];
-    if (pipe(flides) != 0) {
-        perror("pipe failed");
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <program> [args...]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
-    int pid = fork();
+
+    // Prepare command: strace -T program args...
+    int cmd_len = argc + 3;
+    char **cmdArgs = malloc(sizeof(char *) * cmd_len);
+    cmdArgs[0] = "strace";
+    cmdArgs[1] = "-T";
+    for (int i = 1; i < argc; i++) {
+        cmdArgs[i + 1] = argv[i];
+    }
+    cmdArgs[argc + 1] = NULL;
+
+    // pipe for capturing strace stderr
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+
     if (pid == 0) {
-        dup2(flides[1], STDERR_FILENO);
-        close(STDOUT_FILENO);
-        execve("/usr/bin/strace", argv_new, env);
-    } else {
-        FILE *input = fdopen(flides[0], "r");
-        clear();
-        while (true) {
-            // read
-            memset(tmp, 0, sizeof(tmp));
-            do {
-                fgets(ttmp, 1024, input);
-                strcat(tmp, ttmp);
+        // Child process
+        close(pipefd[0]);
+        dup2(pipefd[1], STDERR_FILENO);  // Redirect stderr to pipe
+        int null_fd = open("/dev/null", O_RDWR);
+        dup2(null_fd, STDOUT_FILENO);    // Redirect stdout to /dev/null
+        close(null_fd);
 
-                if (strncmp(ttmp, "/usr/bin/strace", 15) == 0) {
-                    printf("%s+++  Fail to run sperf +++\n",
-                           tmp);
-                    signal_callback_handler(1);
-                }
-                if (strncmp(ttmp, "+++", 3) == 0) {
-                    draw();
-                    signal_callback_handler(0);
-                }
-            } while (tmp[strlen(tmp) - 2] != '>');
+        // Search strace in PATH
+        char *path_env = getenv("PATH");
+        char *path_copy = strdup(path_env);
+        char *token = strtok(path_copy, ":");
+        while (token) {
+            char fullpath[256];
+            snprintf(fullpath, sizeof(fullpath), "%s/strace", token);
+            execve(fullpath, cmdArgs, environ);
+            token = strtok(NULL, ":");
+        }
 
-            // parse name
-            int t;
-            for (t = 0; t < strlen(tmp); ++t) {
-                if (tmp[t] == '(')
+        fprintf(stderr, "strace not found in PATH\n");
+        exit(127);
+    }
+
+    // Parent process
+    close(pipefd[1]);
+    FILE *fp = fdopen(pipefd[0], "r");
+    if (!fp) {
+        perror("fdopen");
+        exit(EXIT_FAILURE);
+    }
+
+    struct syscallStat stats[MAX_SYSCALL];
+    int stat_count = 0;
+    double total_time = 0;
+
+    struct timeval last_time, current_time;
+    gettimeofday(&last_time, NULL);
+
+    char buf[BUF_SIZE];
+    while (fgets(buf, sizeof(buf), fp)) {
+        char syscall[64];
+        double usec;
+
+        if (sscanf(buf, "%[^<]<%lf>", syscall, &usec) == 2) {
+            // Trim syscall name to exclude parameters
+            for (int i = 0; syscall[i]; i++) {
+                if (syscall[i] == '(') {
+                    syscall[i] = '\0';
                     break;
+                }
             }
-            if (t == strlen(tmp))
-                continue;
-            strncpy(name, tmp, t);
-            name[t] = '\0';
 
-            // parse time
-            double dur;
-            for (t = strlen(tmp) - 1; t >= 0; --t) {
-                if (tmp[t] == '<')
+            // Accumulate stats
+            int found = 0;
+            for (int i = 0; i < stat_count; i++) {
+                if (strcmp(stats[i].name, syscall) == 0) {
+                    stats[i].time += usec;
+                    found = 1;
                     break;
+                }
             }
-            if (t < 0)
-                continue;
-            sscanf(tmp + t + 1, "%lf", &dur);
-            info[loc(name)].time += dur;
 
-            // draw output
-            time_t now = time(NULL);
-            if (now - begin >= 1) {
-                draw();
-                begin = now;
+            if (!found && stat_count < MAX_SYSCALL) {
+                strncpy(stats[stat_count].name, syscall, sizeof(stats[stat_count].name) - 1);
+                stats[stat_count].time = usec;
+                stat_count++;
             }
+
+            total_time += usec;
+        }
+
+        // Check time
+        gettimeofday(&current_time, NULL);
+        if (current_time.tv_sec != last_time.tv_sec) {
+            qsort(stats, stat_count, sizeof(struct syscallStat), cmp);
+            for (int i = 0; i < 5 && i < stat_count; i++) {
+                int percent = (int)((stats[i].time / total_time) * 100);
+                printf("%s (%d%%)\n", stats[i].name, percent);
+            }
+            printf("==================\n");
+            for (int i = 0; i < 80; i++) putchar('\0');
+            fflush(stdout);
+            gettimeofday(&last_time, NULL);
         }
     }
 
+    // Final output
+    qsort(stats, stat_count, sizeof(struct syscallStat), cmp);
+    for (int i = 0; i < 5 && i < stat_count; i++) {
+        int percent = (int)((stats[i].time / total_time) * 100);
+        printf("%s (%d%%)\n", stats[i].name, percent);
+    }
+    printf("==================\n");
+    for (int i = 0; i < 80; i++) putchar('\0');
+    fflush(stdout);
+
+    wait(NULL); // Wait for child
+    free(cmdArgs);
     return 0;
 }
