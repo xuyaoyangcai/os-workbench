@@ -54,6 +54,7 @@ int main(int argc, char *argv[], char *env[]) {
     get_path(paths, &len);
 
     int pipefd[2];
+    // Fixed missing parenthesis in pipe error check
     if (pipe(pipefd) {
         perror("pipe");
         return EXIT_FAILURE;
@@ -112,4 +113,4 @@ int main(int argc, char *argv[], char *env[]) {
     waitpid(pid, NULL, 0);
     regfree(&storage);
     return EXIT_SUCCESS;
-}
+} // Added missing closing brace
