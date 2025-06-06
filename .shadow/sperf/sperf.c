@@ -7,124 +7,109 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <errno.h>
 
-int die=0;
-
-void handler(int sig){
-    die = 1;
-    // printf("done");
-    // wait(NULL);
-    // exit(EXIT_SUCCESS);
-}
-
-char paths[256][512];
-int len;
 regex_t storage;
 
-void get_path(){
+void get_path(char paths[][512], int *len) {
     char *path = getenv("PATH");
-
-    int i=0,count = 0, pstart=0;
-
-    for(char *p=path;*p!=0;p++){
-        count++;
-        if(*p==':'){
-
-            strncpy(paths[i], path+pstart, count-1);
-            i++;
-            pstart=p-path+1;
-            count=0;
-        }
+    if (!path) {
+        *len = 0;
+        return;
     }
-    len = i;
+
+    char *copy = strdup(path);
+    char *token = strtok(copy, ":");
+    *len = 0;
+
+    while (token && *len < 256) {
+        strncpy(paths[*len], token, 511);
+        paths[*len][511] = '\0';
+        (*len)++;
+        token = strtok(NULL, ":");
+    }
+    free(copy);
 }
 
-void match(char *line){
-    size_t nmatch = 2;
-    regmatch_t pmatch[nmatch];
-    int ret=0;
-    if((ret=regexec(&storage, line, nmatch, pmatch, 0))!=REG_NOMATCH){
-
-        char buf2[4096];
-
-        strncpy(buf2, line+pmatch[1].rm_so,pmatch[1].rm_eo);
-        buf2[line+pmatch[1].rm_so,pmatch[1].rm_eo] = 0;
-        printf("%s\n", buf2);
+void match(char *line) {
+    regmatch_t pmatch[2];
+    if (regexec(&storage, line, 2, pmatch, 0) == 0) {
+        char name[128];
+        int len = pmatch[1].rm_eo - pmatch[1].rm_so;
+        if (len > 127) len = 127;
+        strncpy(name, line + pmatch[1].rm_so, len);
+        name[len] = '\0';
+        printf("%s\n", name);
     }
 }
-
 
 int main(int argc, char *argv[], char *env[]) {
-    regcomp(&storage,"^(.*?)\\(.*?\\) += [0-9?\\-]+.*?$", REG_NEWLINE|REG_EXTENDED);
+    if (regcomp(&storage, "^([a-zA-Z0-9_]+)\\(", REG_EXTENDED) != 0) {
+        perror("Failed to compile regex");
+        return EXIT_FAILURE;
+    }
 
-    signal(SIGCHLD, handler);
-
-    get_path();
+    char paths[256][512];
+    int len;
+    get_path(paths, &len);
 
     int pipefd[2];
+    if (pipe(pipefd) {
+        perror("pipe");
+        return EXIT_FAILURE;
+    }
 
-    if(pipe(pipefd)<0)exit(EXIT_FAILURE);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
 
-    int pid;
-
-
-
-    if((pid=fork())==0){ // child
-
-        argv[0] = "strace";
-        close(pipefd[0]); // close read fd
+    if (pid == 0) { // Child
+        close(pipefd[0]);
         dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
 
-        for(int i=0;i<len;i++){
-            char buf[512];
-            strcpy(buf,paths[i]);
-
-            if(execve(strcat(buf,"/strace"),argv, env )<0){
-                continue;
+        for (int i = 0; i < len; i++) {
+            char full_path[1024];
+            snprintf(full_path, sizeof(full_path), "%s/strace", paths[i]);
+            execve(full_path, argv, env);
+            if (errno != ENOENT) {
+                perror("execve");
+                exit(EXIT_FAILURE);
             }
+        }
+        fprintf(stderr, "strace not found in PATH\n");
+        exit(EXIT_FAILURE);
+    }
 
+    // Parent
+    close(pipefd[1]);
+    char buffer[4096];
+    ssize_t bytes;
+    char line[4096];
+    size_t line_len = 0;
+
+    while ((bytes = read(pipefd[0], buffer, sizeof(buffer))) {
+        if (bytes < 0) {
+            if (errno == EINTR) continue;
+            perror("read");
+            break;
         }
 
-    }
-
-    close(pipefd[1]); // close write
-
-
-    char buf[1<<16];
-    char *line;
-    while(die!=1){
-
-        sleep(1);
-        size_t count;
-        do{
-
-            count = read(pipefd[0], buf,1<<16);
-            int offect=0;
-            // write(STDOUT_FILENO,buf,count);
-
-            while(offect<count){
-                line = buf+offect;
-                int i=0;
-                for(;line[i]!='\n';i++){
-                    offect++;
-                }
-                offect++;
-                line[i]=0;
-                // printf("%s", line);
-                match(line);
+        for (ssize_t i = 0; i < bytes; i++) {
+            if (buffer[i] == '\n') {
+                line[line_len] = '\0';
+                if (line_len > 0) match(line);
+                line_len = 0;
+            } else if (line_len < sizeof(line) - 1) {
+                line[line_len++] = buffer[i];
             }
-
-
-
-
-        }while(count);
-
-
-        if(waitpid(pid, NULL,WNOHANG )==pid)exit(0);
-
-
+        }
     }
 
-
-
+    close(pipefd[0]);
+    waitpid(pid, NULL, 0);
+    regfree(&storage);
+    return EXIT_SUCCESS;
 }
