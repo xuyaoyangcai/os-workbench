@@ -86,7 +86,7 @@ int output(SyscallStats* stats, bool is_end)
 
     printf("Total: %fs\n", total);
     for (int i = 0; i < stats->count; i++) {
-        int ratio = stats->logs[i].time / total * 100;
+        int ratio = (int)(stats->logs[i].time / total * 100);
         printf("%s (%d%%)\n", stats->logs[i].name, ratio);
         if (i == 4) {
             printf("...\n");
@@ -116,8 +116,10 @@ void child_process(int pfd[], int argc, char* argv[])
     close(STDERR_FILENO);
 
     close(pfd[0]);
-    int dpr = dup2(pfd[1], memfd);
-    assert(dpr != -1);
+    // 将管道写端复制到 memfd，这一步你原本写得有误，dup2参数顺序应是 (oldfd, newfd)
+    // 但这里你想让 strace 输出写入 memfd，应该是将 memfd 复制为 STDOUT_FILENO 或 STDERR_FILENO?
+    // 其实 strace -o memfd_path 会自己写到 memfd_path，不需要这步
+    // 所以这里直接关闭 pfd[1]，不需要 dup2(pfd[1], memfd)
     close(pfd[1]);
 
     char* exec_argv[argc + 4];
@@ -130,11 +132,9 @@ void child_process(int pfd[], int argc, char* argv[])
     }
     exec_argv[argc + 3] = NULL;
 
-    char path_str[1024] = "PATH=";
-    strncat(path_str, getenv("PATH"), sizeof(path_str) - 5);
-    char* exec_envp[] = { path_str, NULL };
-
-    execve("/usr/bin/strace", exec_argv, exec_envp);
+    // 直接传入 environ，保留完整环境变量
+    execve("/usr/bin/strace", exec_argv, environ);
+    // execve 出错时断言失败退出
     assert(false);
 }
 
@@ -150,7 +150,9 @@ void parent_process(int pfd[])
     clock_t prev = clock();
 
     regex_t reg;
-    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\n$";
+    // 匹配形如：read(3, "a", 1) = 1 <0.000020>
+    // 捕获 syscall 名称和耗时
+    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\\)\n?$";
     int rc = regcomp(&reg, pattern, REG_EXTENDED);
     assert(rc == 0);
 
@@ -178,6 +180,7 @@ int main(int argc, char* argv[])
     if (argc == 1) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
         while (1) pause(); // 不退出，避免“Wrong Answer”
+        return 0;
     }
 
     int pfd[2];
