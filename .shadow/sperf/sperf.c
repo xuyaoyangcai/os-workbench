@@ -1,182 +1,173 @@
-#define _GNU_SOURCE // for memfd_create
 
-#include <assert.h>
-#include <regex.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-
-typedef struct {
-    char name[64];
+#include <string.h>
+#include <assert.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
+extern char** environ;
+struct syscallNameAndTime{
+    char name[50];
     double time;
-} SyscallLog;
+};
+int cmp(const void* s1, const void* s2) {
+    return (*(struct syscallNameAndTime *)s1).time>(*(struct syscallNameAndTime *)s2).time ? -1 : 1;
 
-typedef struct {
-    SyscallLog* logs;
-    int count;
-    int capacity;
-} SyscallStats;
-
-// 正则提取 syscall 和耗时
-SyscallLog* extract(char* line, regex_t* reg) {
-    static SyscallLog log;
-    regmatch_t matches[3];
-
-    if (regexec(reg, line, 3, matches, 0) == 0) {
-        int len = matches[1].rm_eo - matches[1].rm_so;
-        strncpy(log.name, line + matches[1].rm_so, len);
-        log.name[len] = '\0';
-
-        len = matches[2].rm_eo - matches[2].rm_so;
-        char time_str[16];
-        strncpy(time_str, line + matches[2].rm_so, len);
-        time_str[len] = '\0';
-        log.time = atof(time_str);
-
-        return &log;
-    }
-    return NULL;
 }
-
-// 更新统计表
-void update_stats(SyscallLog* log, SyscallStats* stats) {
-    for (int i = 0; i < stats->count; i++) {
-        if (strcmp(stats->logs[i].name, log->name) == 0) {
-            stats->logs[i].time += log->time;
-            return;
+int myReadLine(int fd, char* line) {
+    char ch;
+    int offset = 0;
+    while(read(fd,&ch,1)>0) {
+        line[offset] = ch;
+        if (ch == '\n') {
+            line[offset] = '\0';
+            return 1;
         }
-    }
-
-    if (stats->count == stats->capacity) {
-        stats->capacity = stats->capacity == 0 ? 10 : stats->capacity * 2;
-        stats->logs = realloc(stats->logs, stats->capacity * sizeof(SyscallLog));
-        assert(stats->logs);
-    }
-
-    stats->logs[stats->count++] = *log;
-}
-
-// 排序比较函数
-int compare(const void* a, const void* b) {
-    double diff = ((SyscallLog*)b)->time - ((SyscallLog*)a)->time;
-    return diff > 0 ? 1 : (diff < 0 ? -1 : 0);
-}
-
-// 输出统计信息
-void output(SyscallStats* stats, bool is_end) {
-    qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
-
-    double total = 0;
-    for (int i = 0; i < stats->count; i++) {
-        total += stats->logs[i].time;
-    }
-
-    printf("Total: %fs\n", total);
-    for (int i = 0; i < stats->count && i < 5; i++) {
-        int ratio = (int)(stats->logs[i].time / total * 100);
-        printf("%s (%d%%)\n", stats->logs[i].name, ratio);
-    }
-    if (stats->count > 5) {
-        printf("...\n");
-    }
-
-    // 输出 80 个 \0 分隔
-    for (int i = 0; i < 80; i++) putchar('\0');
-    if (!is_end) printf("====================\n");
-
-    fflush(stdout);
-}
-
-// 子进程：执行 strace -T -o /proc/self/fd/N ...
-void child_process(int pfd[], int argc, char* argv[]) {
-    int memfd = memfd_create("strace_output", MFD_CLOEXEC);
-    assert(memfd != -1);
-
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/self/fd/%d", memfd);
-
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-    close(pfd[0]);
-    assert(dup2(pfd[1], memfd) != -1);
-    close(pfd[1]);
-
-    char* exec_argv[argc + 4];
-    exec_argv[0] = "strace";
-    exec_argv[1] = "-T";
-    exec_argv[2] = "-o";
-    exec_argv[3] = path;
-    for (int i = 1; i < argc; i++) {
-        exec_argv[i + 3] = argv[i];
-    }
-    exec_argv[argc + 3] = NULL;
-
-    char env_buf[1024] = "PATH=";
-    strncat(env_buf, getenv("PATH"), sizeof(env_buf) - 5);
-    char* envp[] = { env_buf, NULL };
-
-    execve("/usr/bin/strace", exec_argv, envp);
-    assert(false); // execve失败不应走到这里
-}
-
-// 父进程：读取子进程 pipe 输出，进行统计和输出
-void parent_process(int pfd[]) {
-    close(pfd[1]);
-    FILE* fp = fdopen(pfd[0], "r");
-    assert(fp);
-
-    char* line = NULL;
-    size_t len = 0;
-    SyscallStats stats = { NULL, 0, 0 };
-    clock_t prev = clock();
-
-    regex_t reg;
-    regcomp(&reg, "^([a-z0-9_]+)\\(.*<([0-9.]+)>\\)\n?$", REG_EXTENDED);
-
-    while (getline(&line, &len, fp) != -1) {
-        SyscallLog* log = extract(line, &reg);
-        if (!log) continue;
-        update_stats(log, &stats);
-
-        clock_t now = clock();
-        if ((now - prev) * 1000 / CLOCKS_PER_SEC > 100) {
-            output(&stats, false);
-            prev = now;
+        if (ch == EOF) {
+            line[offset] = '\0';
+            return 0;
         }
+        offset += 1;
     }
-
-    output(&stats, true);
-    free(line);
-    free(stats.logs);
-    regfree(&reg);
-    fclose(fp);
+    return -1;
 }
+int main(int argc, char *argv[]) {
 
-// 主函数
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        // 🟢 不退出，只挂起，满足测试要求
-        while (1) pause();
+    struct syscallNameAndTime syscallList[1000];
+    for (int i = 0; i < 1000; i++) {
+        strcpy(syscallList[i].name, "NONE");
+        syscallList[i].time = 0;
     }
 
-    int pfd[2];
-    assert(pipe(pfd) == 0);
 
-    pid_t pid = fork();
-    assert(pid != -1);
+    // prepare for trace system call
+    char** cmdArgs = malloc(sizeof(char*)*(argc + 2));
+    cmdArgs[0] = "strace";
+    cmdArgs[1] = "-T";
+    for (int i = 1; i <= argc; i++){
+        cmdArgs[i+1] = argv[i];
+    }
+    char *pathvar = getenv("PATH");
+    char PATH[512] = {0};
+    strcpy(PATH, getenv("PATH"));
+    char* path = malloc(sizeof(char)*(strlen("PATH=") + strlen(pathvar)+1));
+    memset(path, '\0', strlen("PATH=") + strlen(pathvar)+1);
+    strcat(path, "PATH=");
+    strcat(path, pathvar);
+    char *exec_envp[] = { path, NULL, };
+    char *test[] = { "strace", "-T", "ls", NULL, };
+    // execute program
 
+    char** env = environ;
+    int pipefds[2];
+    if(pipe(pipefds) < 0){
+        perror("pipe");
+        assert(0);
+    }
+    pipe(pipefds);
+    int pid = -1;
+    pid = fork();
     if (pid == 0) {
-        child_process(pfd, argc, argv);
+        close(pipefds[0]);
+        dup2(pipefds[1], fileno(stderr));
+        int fd = open("/dev/null",O_RDWR);
+        dup2(fd, fileno(stdout));
+        // 子进程，执行strace命令
+        char*token = strtok(PATH, ":");
+        char stracePath[100];
+        memset(stracePath, '\0', 100);
+        strcat(stracePath, token);
+        strcat(stracePath, "/strace");
+        printf("%s\n", stracePath);
+        while((execve(stracePath, cmdArgs, env)) == -1){
+            memset(stracePath, '\0', 100);
+            strcat(stracePath, strtok(NULL, ":"));
+            strcat(stracePath, "/strace");
+            printf("%s\n", stracePath);
+        }
+        assert(0);
+        // 不应该执行此处代码，否则execve失败，出错处理
     } else {
-        parent_process(pfd);
-        waitpid(pid, NULL, 0);
+        int listLen = 0;
+        double totalTime = 0;
+        close(pipefds[1]);
+        char buf[512];
+        int pre = clock();
+        while(myReadLine(pipefds[0], buf) > 0) {
+            int now = clock();
+            if (now - pre >= CLOCKS_PER_SEC) {
+                qsort(syscallList, listLen, sizeof(struct syscallNameAndTime), cmp);
+                for (int i = 0; i<5 && i < listLen; i++) {
+                    printf("%s (%d%%)\n", syscallList[i].name, (int) ((syscallList[i].time/totalTime)*100));
+                }
+                printf("==================\n");
+                for (int i = 0; i < 80; i++) {
+                    printf("%c",'\0');
+                }
+                fflush(stdout);
+                pre = now;
+            }
+            int len = strlen(buf);
+            int left = -1;
+            int right = len-1;
+            int leftparameter = -1;
+            for (int i = len-1; i >= 0; i--) {
+                if (buf[i] == '<') {
+                    left = i;
+                    break;
+                }
+            }
+            for (int i = 0; i < len; i++) {
+                if (buf[i] == '(') {
+                    leftparameter = i;
+                    break;
+                }
+            }
+            if (buf[right]=='>'){
+                char time[100];
+                char syscall[50];
+                memset(syscall, '\0', 50);
+                memset(time, '\0', 100);
+                if (leftparameter > 0&&('a'<=buf[0] && 'z'>=buf[0])){
+                    memcpy(time, &buf[left+1], (right-left-1));
+                    memcpy(syscall, &buf[0], leftparameter);
+                    double dtime = strtod(time, NULL);
+                    for (int i = 0; i < len; i++) {
+                        if (strcmp(syscallList[i].name, "NONE") != 0) {
+                            if (strcmp(syscallList[i].name, syscall) == 0) {
+                                syscallList[i].time += dtime;
+                                totalTime += dtime;
+                                break;
+                            }
+                        }
+                        if (strcmp(syscallList[i].name, "NONE") == 0) {
+                            listLen += 1;
+                            strcpy(syscallList[i].name, syscall);
+                            syscallList[i].time = dtime;
+                            totalTime += dtime;
+                            assert(syscallList[i].name != NULL);
+                            break;
+                        }
+                    }
+                }
+            }
+            memset(buf, '\0', sizeof(buf));
+        }
+        qsort(syscallList, listLen, sizeof(struct syscallNameAndTime), cmp);
+        for (int i = 0; i<5 && i < listLen; i++) {
+            printf("%s (%d%%)\n", syscallList[i].name, (int) ((syscallList[i].time/totalTime)*100));
+        }
+        printf("==================\n");
+        for (int i = 0; i < 80; i++) {
+            printf("%c",'\0');
+        }
+        fflush(stdout);
+        return 0;
     }
-
     return 0;
+    perror(argv[0]);
+    exit(EXIT_FAILURE);
 }
