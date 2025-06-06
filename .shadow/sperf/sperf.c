@@ -1,212 +1,140 @@
-#define _GNU_SOURCE
-
-#include <assert.h>
-#include <regex.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <string.h>
+#include <assert.h>
 
-extern char **environ;
+#define zassert(x, s) \
+    do { if (!(x)) { fprintf(stderr, "%s\n", s); assert(x); } } while (0)
 
-typedef struct {
-    char name[64];
+char buf[BUFSIZ];
+
+struct info {
+    char name[100];
     double time;
-} SyscallLog;
+    struct info *next;
+};
 
-typedef struct {
-    SyscallLog* logs;
-    int count;
-    int capacity;
-} SyscallStats;
+struct info *syscall_info = NULL;
 
-SyscallLog* extract(char* line, regex_t* reg)
-{
-    regmatch_t matches[3];
-    int len;
-    static SyscallLog log;
-
-    if (regexec(reg, line, 3, matches, 0) == 0) {
-        len = matches[1].rm_eo - matches[1].rm_so;
-        if (len >= (int)sizeof(log.name)) len = sizeof(log.name) - 1;
-        strncpy(log.name, line + matches[1].rm_so, len);
-        log.name[len] = '\0';
-
-        len = matches[2].rm_eo - matches[2].rm_so;
-        if (len >= 16) len = 15;
-        char time_str[16];
-        strncpy(time_str, line + matches[2].rm_so, len);
-        time_str[len] = '\0';
-        log.time = atof(time_str);
-
-        return &log;
-    } else {
-        return NULL;
+// 添加或更新系统调用信息
+void add(double time, const char *name) {
+    for (struct info *i = syscall_info; i != NULL; i = i->next) {
+        if (strcmp(i->name, name) == 0) {
+            i->time += time;
+            return;
+        }
     }
+    struct info *si = (struct info *)malloc(sizeof(struct info));
+    zassert(si != NULL, "malloc failed");
+    strcpy(si->name, name);
+    si->time = time;
+    si->next = syscall_info;
+    syscall_info = si;
 }
 
-int update_stats(SyscallLog* log, SyscallStats* stats)
-{
-    for (int i = 0; i < stats->count; i++) {
-        if (strcmp(stats->logs[i].name, log->name) == 0) {
-            stats->logs[i].time += log->time;
-            return 0;
-        }
-    }
+int main(int argc, char *argv[], char *envp[]) {
+    zassert(argc >= 2, "need at least one argument");
 
-    if (stats->count == stats->capacity) {
-        stats->capacity = stats->capacity == 0 ? 10 : stats->capacity * 2;
-        stats->logs = realloc(stats->logs, stats->capacity * sizeof(SyscallLog));
-        if (!stats->logs) {
-            perror("realloc");
-            exit(EXIT_FAILURE);
-        }
-    }
+    // 构造strace参数数组，跟踪第一个参数的命令
+    char *strace_argv[] = { "strace", "-r", argv[1], NULL };
 
-    memcpy(&stats->logs[stats->count], log, sizeof(SyscallLog));
-    stats->count++;
-
-    return 0;
-}
-
-int compare(const void* a, const void* b)
-{
-    double diff = ((const SyscallLog*)b)->time - ((const SyscallLog*)a)->time;
-    return (diff > 0) ? 1 : ((diff < 0) ? -1 : 0);
-}
-
-int output(SyscallStats* stats, bool is_end)
-{
-    if (stats->count == 0) return 0;
-
-    qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
-
-    double total = 0;
-    for (int i = 0; i < stats->count; i++) {
-        total += stats->logs[i].time;
-    }
-
-    if (total > 0) {
-        printf("Total: %.6fs\n", total);
-        for (int i = 0; i < stats->count && i < 5; i++) {
-            int ratio = (int)(stats->logs[i].time / total * 100);
-            printf("%s (%d%%)\n", stats->logs[i].name, ratio);
-        }
-        if (stats->count > 5) {
-            printf("...\n");
-        }
-    }
-
-    if (!is_end) {
-        printf("====================\n");
-    }
-
-    fflush(stdout);
-    return 0;
-}
-
-void child_process(int pfd[], int argc, char* argv[])
-{
-    close(pfd[0]);
-    if (dup2(pfd[1], STDERR_FILENO) == -1) {
-        perror("dup2");
-        exit(EXIT_FAILURE);
-    }
-    close(pfd[1]);
-
-    // 构造 execvp 参数
-    char** exec_argv = malloc((argc + 3) * sizeof(char*));
-    if (!exec_argv) {
-        perror("malloc");
-        exit(EXIT_FAILURE);
-    }
-
-    exec_argv[0] = "strace";
-    exec_argv[1] = "-T";
-
-    if (argc > 1) {
-        for (int i = 1; i < argc; i++) {
-            exec_argv[i + 1] = argv[i];
-        }
-        exec_argv[argc + 1] = NULL;
-    } else {
-        exec_argv[2] = "sleep";
-        exec_argv[3] = "1000000000";
-        exec_argv[4] = NULL;
-    }
-
-    execvp("strace", exec_argv);
-
-    perror("execvp");
-    free(exec_argv);
-    exit(EXIT_FAILURE);
-}
-
-void parent_process(int pfd[])
-{
-    close(pfd[1]);
-    FILE* pipe_fp = fdopen(pfd[0], "r");
-    assert(pipe_fp != NULL);
-
-    SyscallStats stats = { NULL, 0, 0 };
-    char* line = NULL;
-    size_t len = 0;
-    clock_t prev = clock();
-
-    regex_t reg;
-    // 匹配形式: syscall(...) = ... <time>
-    const char* pattern = "([a-z0-9_]+)\\(.*\\)\\s*=.*<([0-9.]+)>";
-    int rc = regcomp(&reg, pattern, REG_EXTENDED | REG_ICASE);
-    if (rc != 0) {
-        fprintf(stderr, "Failed to compile regex\n");
-        exit(EXIT_FAILURE);
-    }
-
-    while (getline(&line, &len, pipe_fp) != -1) {
-        SyscallLog* log = extract(line, &reg);
-        if (log != NULL) {
-            update_stats(log, &stats);
-        }
-
-        clock_t now = clock();
-        if ((now - prev) * 1000.0 / CLOCKS_PER_SEC > 1000) { // 1秒刷新
-            output(&stats, false);
-            prev = now;
-        }
-    }
-    output(&stats, true);
-
-    free(line);
-    free(stats.logs);
-    regfree(&reg);
-    fclose(pipe_fp);
-}
-
-int main(int argc, char* argv[])
-{
-    int pfd[2];
-    if (pipe(pfd) != 0) {
-        perror("pipe");
-        return EXIT_FAILURE;
-    }
+    int pipefd[2];
+    zassert(pipe(pipefd) == 0, "create pipe failed");
 
     pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return EXIT_FAILURE;
-    }
+    zassert(pid >= 0, "fork failed");
 
     if (pid == 0) {
-        child_process(pfd, argc, argv);
+        // 子进程：重定向stderr到管道写端
+        close(pipefd[0]);          // 关闭管道读端
+        dup2(pipefd[1], STDERR_FILENO); // stderr -> 管道写端
+        close(pipefd[1]);
+
+        // 关闭stdout，防止命令的标准输出干扰
+        close(STDOUT_FILENO);
+
+        execve("/bin/strace", strace_argv, envp);
+
+        perror("execve failed");
+        exit(EXIT_FAILURE);
     } else {
-        parent_process(pfd);
-        waitpid(pid, NULL, 0);
+        // 父进程：关闭管道写端，读取子进程输出
+        close(pipefd[1]);
+        FILE *fp = fdopen(pipefd[0], "r");
+        zassert(fp != NULL, "fdopen failed");
+
+        double time;
+        char name[100];
+
+        while (fgets(buf, sizeof(buf), fp)) {
+            // strace -r 格式示例:
+            // 0.000012 read(3, "", 0) = 0
+            // 1.2345678 openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+            // sscanf按格式读第一个double和一个字符串
+            if (sscanf(buf, "%lf %99s", &time, name) != 2) {
+                continue; // 解析失败跳过
+            }
+
+            if (name[0] == '+') { // 忽略类似 "+ ..." 的行
+                continue;
+            }
+
+            // 去掉name中的参数部分，比如 openat(...) -> openat
+            for (int i = 0; name[i]; i++) {
+                if (name[i] == '(') {
+                    name[i] = '\0';
+                    break;
+                }
+            }
+
+            add(time, name);
+        }
+
+        fclose(fp);
+
+        // 统计总时间和排序
+        double total = 0.0;
+        struct info syscall_sort[5] = {0};
+
+        for (struct info *i = syscall_info; i != NULL; i = i->next) {
+            total += i->time;
+            // 插入排序维护top5耗时最大调用
+            for (int j = 0; j < 5; j++) {
+                if (syscall_sort[j].time < i->time) {
+                    for (int k = 4; k > j; k--) {
+                        syscall_sort[k] = syscall_sort[k - 1];
+                    }
+                    syscall_sort[j] = *i;
+                    break;
+                }
+            }
+        }
+
+        if (total == 0) {
+            printf("No syscall time recorded.\n");
+        } else {
+            double others = total;
+            printf("Top 5 syscalls by time spent:\n");
+            for (int i = 0; i < 5; i++) {
+                if (syscall_sort[i].time > 0) {
+                    double percent = syscall_sort[i].time / total * 100;
+                    printf("%-20s : %.6f s (%.2f%%)\n", syscall_sort[i].name, syscall_sort[i].time, percent);
+                    others -= syscall_sort[i].time;
+                }
+            }
+            if (others > 0.000001) {
+                printf("%-20s : %.6f s (%.2f%%)\n", "others", others, others / total * 100);
+            }
+            printf("Total time: %.6f s\n", total);
+        }
+
+        // 释放链表内存
+        while (syscall_info) {
+            struct info *tmp = syscall_info;
+            syscall_info = syscall_info->next;
+            free(tmp);
+        }
     }
 
     return 0;
