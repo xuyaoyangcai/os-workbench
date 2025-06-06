@@ -105,10 +105,20 @@ int output(SyscallStats* stats, bool is_end)
 
 void child_process(int pfd[], int argc, char* argv[])
 {
+    // 保存原来的stderr
+    int saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0) {
+        perror("dup");
+        _exit(1);
+    }
+
     // 关闭管道读端
     close(pfd[0]);
-    // 重定向 stderr 到管道写端，strace 输出会写到 stderr
-    dup2(pfd[1], STDERR_FILENO);
+    // 重定向 stderr 到管道写端
+    if (dup2(pfd[1], STDERR_FILENO) < 0) {
+        perror("dup2");
+        _exit(1);
+    }
     close(pfd[1]);
 
     char* exec_argv[argc + 2];
@@ -119,10 +129,13 @@ void child_process(int pfd[], int argc, char* argv[])
     }
     exec_argv[argc + 1] = NULL;
 
-    // 传入完整环境变量 environ
     execve("/usr/bin/strace", exec_argv, environ);
 
-    // execve失败则退出
+    // execve失败：恢复原来的stderr并输出错误
+    if (dup2(saved_stderr, STDERR_FILENO) < 0) {
+        _exit(1);
+    }
+    close(saved_stderr);
     perror("execve");
     _exit(1);
 }
@@ -168,7 +181,7 @@ int main(int argc, char* argv[])
 {
     if (argc == 1) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
-        while (1) pause(); // 不退出，避免 WA
+        exit(1); // 修复：正确退出而非无限循环
     }
 
     int pfd[2];
@@ -181,7 +194,19 @@ int main(int argc, char* argv[])
         child_process(pfd, argc, argv);
     } else {
         parent_process(pfd);
-        waitpid(pid, NULL, 0);
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            int exit_code = WEXITSTATUS(status);
+            if (exit_code != 0) {
+                fprintf(stderr, "Command exited with status %d\n", exit_code);
+                return exit_code;
+            }
+        } else if (WIFSIGNALED(status)) {
+            int sig = WTERMSIG(status);
+            fprintf(stderr, "Command terminated by signal %d\n", sig);
+            return 128 + sig;
+        }
     }
     return 0;
 }
