@@ -9,6 +9,8 @@
 #include <regex.h>
 #include <sys/select.h>
 #include <signal.h>
+#include <sys/wait.h>
+
 
 #define NODE_NUM 1000
 #define MAX_LEN 512
