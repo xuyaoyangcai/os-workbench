@@ -11,6 +11,7 @@
 
 #define MAX_SYSCALL 1024
 #define BUF_SIZE 512
+extern char **environ;
 
 struct syscallStat {
     char name[64];
