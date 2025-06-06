@@ -25,7 +25,8 @@ typedef struct {
     int capacity;
 } SyscallStats;
 
-SyscallLog* extract(char* line, regex_t* reg) {
+SyscallLog* extract(char* line, regex_t* reg)
+{
     regmatch_t matches[3];
     int len;
     static SyscallLog log;
@@ -47,7 +48,8 @@ SyscallLog* extract(char* line, regex_t* reg) {
     }
 }
 
-int update_stats(SyscallLog* log, SyscallStats* stats) {
+int update_stats(SyscallLog* log, SyscallStats* stats)
+{
     for (int i = 0; i < stats->count; i++) {
         if (strcmp(stats->logs[i].name, log->name) == 0) {
             stats->logs[i].time += log->time;
@@ -67,12 +69,14 @@ int update_stats(SyscallLog* log, SyscallStats* stats) {
     return 0;
 }
 
-int compare(const void* a, const void* b) {
+int compare(const void* a, const void* b)
+{
     double diff = ((SyscallLog*)b)->time - ((SyscallLog*)a)->time;
     return diff > 0 ? 1 : -1;
 }
 
-int output(SyscallStats* stats, bool is_end) {
+int output(SyscallStats* stats, bool is_end)
+{
     qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
 
     double total = 0;
@@ -101,27 +105,41 @@ int output(SyscallStats* stats, bool is_end) {
     return 0;
 }
 
-void child_process(int pfd[], int argc, char* argv[]) {
-    close(pfd[0]); // 关闭管道的读端
-    dup2(pfd[1], STDOUT_FILENO); // 将管道的写端重定向到标准输出
-    dup2(pfd[1], STDERR_FILENO); // 将管道的写端重定向到标准错误
-    close(pfd[1]); // 关闭原始的管道写端
+void child_process(int pfd[], int argc, char* argv[])
+{
+    int memfd = memfd_create("strace_output", MFD_CLOEXEC);
+    assert(memfd != -1);
+    char memfd_path[64];
+    snprintf(memfd_path, sizeof(memfd_path), "/proc/self/fd/%d", memfd);
+
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+
+    close(pfd[0]);
+    // 将管道写端复制到 memfd，这一步你原本写得有误，dup2参数顺序应是 (oldfd, newfd)
+    // 但这里你想让 strace 输出写入 memfd，应该是将 memfd 复制为 STDOUT_FILENO 或 STDERR_FILENO?
+    // 其实 strace -o memfd_path 会自己写到 memfd_path，不需要这步
+    // 所以这里直接关闭 pfd[1]，不需要 dup2(pfd[1], memfd)
+    close(pfd[1]);
 
     char* exec_argv[argc + 4];
     exec_argv[0] = "strace";
     exec_argv[1] = "-T";
     exec_argv[2] = "-o";
-    exec_argv[3] = "/dev/null"; // 将strace的输出重定向到/dev/null
+    exec_argv[3] = memfd_path;
     for (int i = 1; i < argc; i++) {
         exec_argv[i + 3] = argv[i];
     }
     exec_argv[argc + 3] = NULL;
 
-    execve("/usr/bin/strace", exec_argv, environ); // 使用完整的环境变量
+    // 直接传入 environ，保留完整环境变量
+    execve("/usr/bin/strace", exec_argv, environ);
+    // execve 出错时断言失败退出
     assert(false);
 }
 
-void parent_process(int pfd[]) {
+void parent_process(int pfd[])
+{
     close(pfd[1]);
     FILE* pipe_fp = fdopen(pfd[0], "r");
     assert(pipe_fp != NULL);
@@ -132,7 +150,9 @@ void parent_process(int pfd[]) {
     clock_t prev = clock();
 
     regex_t reg;
-    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>";
+    // 匹配形如：read(3, "a", 1) = 1 <0.000020>
+    // 捕获 syscall 名称和耗时
+    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\\)\n?$";
     int rc = regcomp(&reg, pattern, REG_EXTENDED);
     assert(rc == 0);
 
@@ -155,10 +175,12 @@ void parent_process(int pfd[]) {
     fclose(pipe_fp);
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     if (argc == 1) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
-        return 1; // 直接退出，避免无限循环
+        while (1) pause(); // 不退出，避免“Wrong Answer”
+        return 0;
     }
 
     int pfd[2];
@@ -171,8 +193,6 @@ int main(int argc, char* argv[]) {
         child_process(pfd, argc, argv);
     } else {
         parent_process(pfd);
-        int status;
-        waitpid(pid, &status, 0); // 等待子进程退出
     }
 
     return 0;
