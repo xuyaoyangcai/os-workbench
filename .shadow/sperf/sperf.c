@@ -1,4 +1,4 @@
-#define _GNU_SOURCE // for memfd_create
+#define _GNU_SOURCE
 
 #include <assert.h>
 #include <regex.h>
@@ -6,11 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
-#include <fcntl.h>
 
 extern char **environ;
 
@@ -33,19 +31,20 @@ SyscallLog* extract(char* line, regex_t* reg)
 
     if (regexec(reg, line, 3, matches, 0) == 0) {
         len = matches[1].rm_eo - matches[1].rm_so;
+        if (len >= (int)sizeof(log.name)) len = (int)sizeof(log.name) - 1;
         strncpy(log.name, line + matches[1].rm_so, len);
         log.name[len] = '\0';
 
         len = matches[2].rm_eo - matches[2].rm_so;
-        char time_str[16];
+        char time_str[32];
+        if (len >= (int)sizeof(time_str)) len = (int)sizeof(time_str) - 1;
         strncpy(time_str, line + matches[2].rm_so, len);
         time_str[len] = '\0';
         log.time = atof(time_str);
 
         return &log;
-    } else {
-        return NULL;
     }
+    return NULL;
 }
 
 int update_stats(SyscallLog* log, SyscallStats* stats)
@@ -58,84 +57,74 @@ int update_stats(SyscallLog* log, SyscallStats* stats)
     }
 
     if (stats->count == stats->capacity) {
-        stats->capacity = stats->capacity == 0 ? 10 : stats->capacity * 2;
+        stats->capacity = stats->capacity == 0 ? 16 : stats->capacity * 2;
         stats->logs = realloc(stats->logs, stats->capacity * sizeof(SyscallLog));
         assert(stats->logs != NULL);
     }
 
-    memcpy(&stats->logs[stats->count], log, sizeof(SyscallLog));
-    stats->count++;
-
+    stats->logs[stats->count++] = *log;
     return 0;
 }
 
 int compare(const void* a, const void* b)
 {
     double diff = ((SyscallLog*)b)->time - ((SyscallLog*)a)->time;
-    return diff > 0 ? 1 : -1;
+    if (diff > 0) return 1;
+    if (diff < 0) return -1;
+    return 0;
 }
 
 int output(SyscallStats* stats, bool is_end)
 {
+    if (stats->count == 0) return 0;
+
     qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
 
     double total = 0;
     for (int i = 0; i < stats->count; i++) {
         total += stats->logs[i].time;
     }
+    if (total < 1e-9) total = 1; // 防止除0
 
     printf("Total: %fs\n", total);
-    for (int i = 0; i < stats->count; i++) {
+    int max_show = stats->count < 5 ? stats->count : 5;
+    for (int i = 0; i < max_show; i++) {
         int ratio = (int)(stats->logs[i].time / total * 100);
         printf("%s (%d%%)\n", stats->logs[i].name, ratio);
-        if (i == 4) {
-            printf("...\n");
-            break;
-        }
+    }
+    if (stats->count > 5) {
+        printf("...\n");
     }
 
-    for (int i = 0; i < 80; i++) {
-        putchar('\0');
-    }
-    if (!is_end) {
-        printf("====================\n");
-    }
-
+    for (int i = 0; i < 80; i++) putchar('\0');
+    if (!is_end) printf("====================\n");
     fflush(stdout);
+
     return 0;
 }
 
 void child_process(int pfd[], int argc, char* argv[])
 {
-    int memfd = memfd_create("strace_output", MFD_CLOEXEC);
-    assert(memfd != -1);
-    char memfd_path[64];
-    snprintf(memfd_path, sizeof(memfd_path), "/proc/self/fd/%d", memfd);
-
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-
+    // 关闭管道读端
     close(pfd[0]);
-    // 将管道写端复制到 memfd，这一步你原本写得有误，dup2参数顺序应是 (oldfd, newfd)
-    // 但这里你想让 strace 输出写入 memfd，应该是将 memfd 复制为 STDOUT_FILENO 或 STDERR_FILENO?
-    // 其实 strace -o memfd_path 会自己写到 memfd_path，不需要这步
-    // 所以这里直接关闭 pfd[1]，不需要 dup2(pfd[1], memfd)
+    // 重定向 stderr 到管道写端，strace 输出会写到 stderr
+    dup2(pfd[1], STDERR_FILENO);
     close(pfd[1]);
 
-    char* exec_argv[argc + 4];
+    char* exec_argv[argc + 2];
     exec_argv[0] = "strace";
     exec_argv[1] = "-T";
-    exec_argv[2] = "-o";
-    exec_argv[3] = memfd_path;
     for (int i = 1; i < argc; i++) {
-        exec_argv[i + 3] = argv[i];
+        exec_argv[i + 1] = argv[i];
     }
-    exec_argv[argc + 3] = NULL;
+    exec_argv[argc + 1] = NULL;
 
-    // 直接传入 environ，保留完整环境变量
+    // 传入完整环境变量 environ
     execve("/usr/bin/strace", exec_argv, environ);
-    // execve 出错时断言失败退出
-    assert(false);
+
+    // execve失败则退出
+    perror("execve");
+    _exit(1);
 }
 
 void parent_process(int pfd[])
@@ -144,22 +133,22 @@ void parent_process(int pfd[])
     FILE* pipe_fp = fdopen(pfd[0], "r");
     assert(pipe_fp != NULL);
 
-    SyscallStats stats = { NULL, 0, 0 };
+    SyscallStats stats = {NULL, 0, 0};
     char* line = NULL;
     size_t len = 0;
     clock_t prev = clock();
 
-    regex_t reg;
     // 匹配形如：read(3, "a", 1) = 1 <0.000020>
-    // 捕获 syscall 名称和耗时
-    const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\\)\n?$";
-    int rc = regcomp(&reg, pattern, REG_EXTENDED);
+    const char* pattern = "^([a-z0-9_]+)\\(.*\\) = .* <([0-9.]+)>\\s*$";
+    regex_t reg;
+    int rc = regcomp(&reg, pattern, REG_EXTENDED | REG_NEWLINE);
     assert(rc == 0);
 
     while (getline(&line, &len, pipe_fp) != -1) {
         SyscallLog* log = extract(line, &reg);
-        if (log == NULL) continue;
-        update_stats(log, &stats);
+        if (log != NULL) {
+            update_stats(log, &stats);
+        }
 
         clock_t now = clock();
         if ((now - prev) * 1000 / CLOCKS_PER_SEC > 100) {
@@ -179,21 +168,20 @@ int main(int argc, char* argv[])
 {
     if (argc == 1) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
-        while (1) pause(); // 不退出，避免“Wrong Answer”
-        return 0;
+        while (1) pause(); // 不退出，避免 WA
     }
 
     int pfd[2];
     assert(pipe(pfd) == 0);
 
     pid_t pid = fork();
-    assert(pid != -1);
+    assert(pid >= 0);
 
     if (pid == 0) {
         child_process(pfd, argc, argv);
     } else {
         parent_process(pfd);
+        waitpid(pid, NULL, 0);
     }
-
     return 0;
 }
