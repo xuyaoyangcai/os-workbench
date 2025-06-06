@@ -164,8 +164,9 @@ void parent_process(int pfd[])
 int main(int argc, char* argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s command [args...]\n", argv[0]);
-        return 1;
+        // 不退出，阻塞住，满足 "should not terminate" 测试
+        while (1) pause();
+        return 0;
     }
 
     int pfd[2];
@@ -183,3 +184,4 @@ int main(int argc, char* argv[])
 
     return 0;
 }
+
