@@ -2,114 +2,204 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <regex.h>
 #include <string.h>
-#include <malloc.h>
-#include <assert.h>
-#define zassert(x, s) \
-	do { if ((x) == 0) { printf("%s\n", s); assert((x)); } } while (0)
+#include <sys/wait.h>
+#include <time.h>
 
-char buf[BUFSIZ];
-struct info {
-    char name[100];
+// 输出前 5 个耗时百分比
+#define MAX_PRINT_CMD 5
+// 定义 read 的缓冲区的大小
+#define MAX_LINE 4096
+
+// 最多存储的命令数量
+#define MAX_CMD_NUM 100
+// 最长命令名字的字符长度
+#define MAX_NAME_LEN 20
+// 命令存储索引
+int command_index = 0;
+
+// 存储命令结构体，包括命令名称 name 以及命令运行的时间 time
+struct command_info
+{
+    char   name[MAX_NAME_LEN];
     double time;
-    struct info *next;
-};
-struct info *syscall_info = NULL;
-void add(double time, char *name) {
-    for (struct info *i = syscall_info; i != NULL; i = i->next) {
-        if (strcmp(i->name, name) == 0) {
-            i->time += time;
-            return;
-        }
-    }
-    struct info *si = (struct info *)malloc(sizeof(struct info));
-    strcpy(si->name, name);
-    si->time = time;
-    si->next = syscall_info;
-    /* printf("-- %lf %s\n", si->time, si->name); */
-    syscall_info = si;
+} command_info_vec[MAX_CMD_NUM];
+// 命令结构体的比较方式，qsort 中会用到
+int compare(const void *a, const void *b)
+{
+    struct command_info *c1 = (struct command_info *)a;
+    struct command_info *c2 = (struct command_info *)b;
+    if(c1->time < c2->time)
+        return 1;
+    else if(c1->time > c2->time)
+        return -1;
+    else
+        return 0;
 }
 
-int main(int argc, char *argv[], char *envp[]) {
-    zassert(argc >= 2, "need at least one argument");
+// 正则表达式匹配方式
+int pick_regex(const char* string,const char* pattern);
+void display();
 
-    char *strace_argv[] = { "strace", "-r", argv[1], NULL };
-    int pipefd[2];
-    int pid;
 
-    zassert(pipe(pipefd) == 0, "create pipe failed");
+int main(int argc, char *argv[]) {
+    // 定义正则表达式的格式
+    const char *pattern = "([a-zA-Z_][a-zA-Z0-9_]*)[^<]*<([^>]*)>";
 
+    int size = argc + 2;
+    // 设定参数以及环境变量
+    char** exec_argv = malloc(size * sizeof(char*));
+    char*  exec_envp[] = { "PATH=/bin:/usr/bin:/usr/local/bin:.", NULL, };
+
+    pid_t pid;
+    int fildes[2];
+    int n;
+
+    int status;
+
+    // 根据 main 输入构建 exec_argv
+    exec_argv[0] = "strace";
+    exec_argv[1] = "-T";
+    for(int i = 2; i < argc + 1; ++i)
+    {
+        exec_argv[i] = argv[i-1];
+    }
+    // 添加NULL结尾
+    exec_argv[argc + 1] = NULL;
+
+    // 建立管道
+    if (pipe(fildes) != 0)
+    {
+        // 出错处理
+        perror("pipe error!");
+    }
+    // 创建子进程
     pid = fork();
-    if (pid == 0) {
-        // 关闭stderr
-        close(2);
-        // 将stderr接到管道的输入，stderr将输出到管道的输入
-        dup2(pipefd[1], 2);
-        close(pipefd[1]);
-        // 关闭stdout（比如ls，会输出到stdout）
-        close(1);
-        // 关闭管道输出，用不到
-        close(pipefd[0]);
-
-        execve("/bin/strace", strace_argv, envp);
-        zassert(0, "execve failed");
+    if(pid < 0)
+    {
+        perror("fork error!");
     }
-    else {
-        // 关掉父进程的管道输入，不然管道输出会阻塞
-        close(pipefd[1]);
-        double time;
-        char name[100];
+        // 对于子进程
+    else if (pid == 0)
+    {
+#ifdef DEBUG
+        printf("Child Origin:fildes[0] = %d, fildes[1] = %d\n", fildes[0], fildes[1]);
+#endif
+        // 关闭子进程的读部分
+        close(fildes[0]);
+        // 将 strace 的输出重定向到子进程的写部分
+        dup2(fildes[1], STDERR_FILENO);
+        // 丢弃 strace 调用的函数本身的输出
+        int nullfd = open("/dev/null", O_WRONLY);
+        dup2(nullfd, STDOUT_FILENO);
+#ifdef DEBUG
+        printf("Child:fildes[0] = %d, fildes[1] = %d\n", fildes[0], fildes[1]);
+#endif
+        // 子进程，执行strace命令
+        execve("/bin/strace", exec_argv, exec_envp);
 
-        while (fgets(buf, sizeof(buf), fdopen(pipefd[0], "r"))) {
-            /* printf("%s", buf); */
-            sscanf(buf, "%lf %s", &time, name);
-            if (name[0] == '+') { continue; }
+    }
+        // 对于父进程
+    else
+    {
+#ifdef DEBUG
+        printf("Parent:fildes[0] = %d, fildes[1] = %d\n", fildes[0], fildes[1]);
+#endif
+        // 关闭父进程的写部分
+        close(fildes[1]);
 
-            for (int i = 0; name[i]; i ++ ) {
-                if (name[i] == '(') {
-                    name[i] = '\0';
-                    break;
-                }
+        char buf[MAX_LINE];
+        dup2(fildes[0], STDIN_FILENO);
+
+        // 计时实现对较长时间的 IO 操作的计时输出
+        time_t begin, end;
+        begin = time(NULL);
+        while(fgets(buf, MAX_LINE, stdin) != NULL)
+        {
+            pick_regex(buf, pattern);
+
+            end = time(NULL);
+            if((end - begin) > 1)
+            {
+                display();
+                begin = time(NULL);
             }
-            add(time, name);
-            /* printf("%lf %s\n", time, name); */
+
         }
+        display();
     }
 
-    double total = 0, others = 0;
-    struct info syscall_sort[5] = { };
+    free(exec_argv);
 
-    for (struct info *i = syscall_info; i != NULL; i = i->next) {
-        for (int j = 0; j < 4; j++) {
-            if (syscall_sort[j].time < i->time) {
-                for (int k = 2; k >= j; k--) {
-                    syscall_sort[k + 1] = syscall_sort[k];
-                }
-                syscall_sort[j] = *i;
-                break;
+    return 0;
+}
+
+
+int pick_regex(const char* string,const char* pattern)
+{
+
+    regex_t regex;
+    regmatch_t matches[3];
+
+    // 构建正则表达式
+    if (regcomp(&regex, pattern, REG_EXTENDED) != 0)
+    {
+        printf("Failed to compile regex pattern\n");
+        return -1;
+    }
+    // 进行正则匹配
+    if (regexec(&regex, string, 3, matches, 0) == 0) {
+        char function_name[100];
+        char time_value[100];
+        // 将匹配到的字符串拷贝出来
+        strncpy(function_name, string + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);
+        strncpy(time_value, string + matches[2].rm_so, matches[2].rm_eo - matches[2].rm_so);
+
+        function_name[matches[1].rm_eo - matches[1].rm_so] = '\0';
+        time_value[matches[2].rm_eo - matches[2].rm_so] = '\0';
+
+        // 匹配结果存储在结构体中，如果之前存过该 key，就增加 value
+        int find_flag = 0;
+        for(int idx = 0; idx < command_index; ++idx)
+        {
+            if(strcmp(command_info_vec[idx].name, function_name) == 0)
+            {
+                command_info_vec[idx].time += strtod(time_value, NULL);
+                find_flag = 1;
             }
         }
-        total += i->time;
-        /* printf("%s (%lf)\n", i->time, i->name); */
-        /* fflush(stdout); */
+
+        if(find_flag == 0)
+        {
+            strcpy(command_info_vec[command_index].name, function_name);
+            command_info_vec[command_index].time = strtod(time_value, NULL);
+            ++command_index;
+        }
+
     }
 
-    others = total;
-    for (int i = 0; i < 5; i++) {
-        if (syscall_sort[i].time > 0) {
-            printf("%s (%lf%%)\n", syscall_sort[i].name, syscall_sort[i].time / total);
-            fflush(stdout);
-            others -= syscall_sort[i].time;
-        }
-        else {
-            printf("%s (%lf%%)\n", "others", others / total);
-            fflush(stdout);
-        }
-    }
 
-    for (struct info *i = syscall_info; i != NULL; ) {
-        struct info *j = i;
-        i = i->next;
-        free(j);
+    regfree(&regex);
+    return 0;
+
+}
+
+void display()
+{
+    // 对不同命令的耗时进行排序
+    qsort(command_info_vec, command_index, sizeof(struct command_info), compare);
+    // 计算总的耗时时间
+    double total_time_cost = 0.0;
+    printf("/*-------- Command Time Cost --------*/\n");
+    for(int i = 0; i < command_index; ++i)
+    {
+        total_time_cost += command_info_vec[i].time;
     }
+    for(int i = 0; i < MAX_PRINT_CMD; ++i)
+    {
+        printf("%d:%s %3.1f%%\n", i, command_info_vec[i].name, 100 * command_info_vec[i].time/total_time_cost);
+    }
+    return;
 }
