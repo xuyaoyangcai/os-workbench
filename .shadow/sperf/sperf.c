@@ -2,171 +2,171 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <assert.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
-#include <time.h>
-extern char** environ;
-struct syscallNameAndTime{
-    char name[50];
-    double time;
-};
-int cmp(const void* s1, const void* s2) {
-    return (*(struct syscallNameAndTime *)s1).time>(*(struct syscallNameAndTime *)s2).time ? -1 : 1;
+#include <sys/wait.h>
+#include <assert.h>
 
+#define regular "%[^(](%*[^)]) = %*[^ ] %fs"
+#define MAX_ENTRIES 1024
+
+typedef struct {
+    char name[128];
+    float time;
+} syscall_entry;
+
+int Pipe[2];
+int *readPort, *writePort;
+int devNull;
+char PATH[1024];
+const char *delim = ":";
+syscall_entry total_table[MAX_ENTRIES];
+syscall_entry current_table[MAX_ENTRIES];
+int total_count = 0;
+int current_count = 0;
+int isEnd = 0;
+
+void Assert(int condition, const char *message) {
+    if (!condition) {
+        fprintf(stderr, "Assertion failed: %s\n", message);
+        exit(EXIT_FAILURE);
+    }
 }
-int myReadLine(int fd, char* line) {
-    char ch;
-    int offset = 0;
-    while(read(fd,&ch,1)>0) {
-        line[offset] = ch;
-        if (ch == '\n') {
-            line[offset] = '\0';
-            return 1;
+
+void update_table(syscall_entry *table, int *count, char *name, float time) {
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(table[i].name, name) == 0) {
+            table[i].time += time;
+            return;
         }
-        if (ch == EOF) {
-            line[offset] = '\0';
-            return 0;
-        }
-        offset += 1;
     }
-    return -1;
+    if (*count < MAX_ENTRIES) {
+        strcpy(table[*count].name, name);
+        table[*count].time = time;
+        (*count)++;
+    }
 }
-int main(int argc, char *argv[]) {
 
-    struct syscallNameAndTime syscallList[1000];
-    for (int i = 0; i < 1000; i++) {
-        strcpy(syscallList[i].name, "NONE");
-        syscallList[i].time = 0;
+void print_table(syscall_entry *table, int count) {
+    for (int i = 0; i < count; i++) {
+        printf("%s: %.6f\n", table[i].name, table[i].time);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+void analysis(char buffer[], ssize_t count) {
+    char name[128];
+    float time = 0.0f;
+
+    if (buffer[0] == '+') {
+        isEnd = 1;
+        return;
     }
 
+    if (sscanf(buffer, regular, name, &time) == 2) {
+        update_table(total_table, &total_count, name, time);
+        update_table(current_table, &current_count, name, time);
+    }
+}
 
-    // prepare for trace system call
-    char** cmdArgs = malloc(sizeof(char*)*(argc + 2));
-    cmdArgs[0] = "strace";
-    cmdArgs[1] = "-T";
-    for (int i = 1; i <= argc; i++){
-        cmdArgs[i+1] = argv[i];
-    }
-    char *pathvar = getenv("PATH");
-    char PATH[512] = {0};
-    strcpy(PATH, getenv("PATH"));
-    char* path = malloc(sizeof(char)*(strlen("PATH=") + strlen(pathvar)+1));
-    memset(path, '\0', strlen("PATH=") + strlen(pathvar)+1);
-    strcat(path, "PATH=");
-    strcat(path, pathvar);
-    char *exec_envp[] = { path, NULL, };
-    char *test[] = { "strace", "-T", "ls", NULL, };
-    // execute program
+void subProcessing(int argc, char *argv[], char *envp[]) {
+    dup2(devNull, fileno(stdout));
+    dup2(devNull, fileno(stderr));
+    close(*readPort);
 
-    char** env = environ;
-    int pipefds[2];
-    if(pipe(pipefds) < 0){
-        perror("pipe");
-        assert(0);
+    char *exec_argv[32] = {"strace", "-T", "-o"};
+    char writeFile[32];
+    sprintf(writeFile, "/proc/self/fd/%d", *writePort);
+    exec_argv[3] = writeFile;
+
+    for (int i = 1; i < argc; i++) {
+        exec_argv[i + 3] = argv[i];
     }
-    pipe(pipefds);
-    int pid = -1;
-    pid = fork();
-    if (pid == 0) {
-        close(pipefds[0]);
-        dup2(pipefds[1], fileno(stderr));
-        int fd = open("/dev/null",O_RDWR);
-        dup2(fd, fileno(stdout));
-        // 子进程，执行strace命令
-        char*token = strtok(PATH, ":");
-        char stracePath[100];
-        memset(stracePath, '\0', 100);
-        strcat(stracePath, token);
-        strcat(stracePath, "/strace");
-        printf("%s\n", stracePath);
-        while((execve(stracePath, cmdArgs, env)) == -1){
-            memset(stracePath, '\0', 100);
-            strcat(stracePath, strtok(NULL, ":"));
-            strcat(stracePath, "/strace");
-            printf("%s\n", stracePath);
-        }
-        assert(0);
-        // 不应该执行此处代码，否则execve失败，出错处理
-    } else {
-        int listLen = 0;
-        double totalTime = 0;
-        close(pipefds[1]);
-        char buf[512];
-        int pre = clock();
-        while(myReadLine(pipefds[0], buf) > 0) {
-            int now = clock();
-            if (now - pre >= CLOCKS_PER_SEC) {
-                qsort(syscallList, listLen, sizeof(struct syscallNameAndTime), cmp);
-                for (int i = 0; i<5 && i < listLen; i++) {
-                    printf("%s (%d%%)\n", syscallList[i].name, (int) ((syscallList[i].time/totalTime)*100));
-                }
-                printf("==================\n");
-                for (int i = 0; i < 80; i++) {
-                    printf("%c",'\0');
-                }
-                fflush(stdout);
-                pre = now;
-            }
-            int len = strlen(buf);
-            int left = -1;
-            int right = len-1;
-            int leftparameter = -1;
-            for (int i = len-1; i >= 0; i--) {
-                if (buf[i] == '<') {
-                    left = i;
-                    break;
-                }
-            }
-            for (int i = 0; i < len; i++) {
-                if (buf[i] == '(') {
-                    leftparameter = i;
-                    break;
-                }
-            }
-            if (buf[right]=='>'){
-                char time[100];
-                char syscall[50];
-                memset(syscall, '\0', 50);
-                memset(time, '\0', 100);
-                if (leftparameter > 0&&('a'<=buf[0] && 'z'>=buf[0])){
-                    memcpy(time, &buf[left+1], (right-left-1));
-                    memcpy(syscall, &buf[0], leftparameter);
-                    double dtime = strtod(time, NULL);
-                    for (int i = 0; i < len; i++) {
-                        if (strcmp(syscallList[i].name, "NONE") != 0) {
-                            if (strcmp(syscallList[i].name, syscall) == 0) {
-                                syscallList[i].time += dtime;
-                                totalTime += dtime;
-                                break;
-                            }
-                        }
-                        if (strcmp(syscallList[i].name, "NONE") == 0) {
-                            listLen += 1;
-                            strcpy(syscallList[i].name, syscall);
-                            syscallList[i].time = dtime;
-                            totalTime += dtime;
-                            assert(syscallList[i].name != NULL);
-                            break;
-                        }
-                    }
-                }
-            }
-            memset(buf, '\0', sizeof(buf));
-        }
-        qsort(syscallList, listLen, sizeof(struct syscallNameAndTime), cmp);
-        for (int i = 0; i<5 && i < listLen; i++) {
-            printf("%s (%d%%)\n", syscallList[i].name, (int) ((syscallList[i].time/totalTime)*100));
-        }
-        printf("==================\n");
-        for (int i = 0; i < 80; i++) {
-            printf("%c",'\0');
-        }
-        fflush(stdout);
-        return 0;
+    exec_argv[argc + 3] = NULL;
+
+    char *token = strtok(PATH, delim);
+    while (token != NULL) {
+        char straceFile[128];
+        sprintf(straceFile, "%s/strace", token);
+        execve(straceFile, exec_argv, envp);
+        token = strtok(NULL, delim);
     }
-    return 0;
-    perror(argv[0]);
+
+    perror("execve failed");
     exit(EXIT_FAILURE);
+}
+
+void parentProcessing() {
+    close(*writePort);
+    char buf[2], arr[1024];
+    int index = 0;
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+
+    while (1) {
+        if (isEnd) {
+            print_table(total_table, total_count);
+            break;
+        }
+
+        while (read(*readPort, buf, 1) > 0) {
+            arr[index++] = buf[0];
+            if (buf[0] == '\n') {
+                arr[index] = '\0';
+                analysis(arr, index);
+                index = 0;
+                break;
+            }
+        }
+
+        gettimeofday(&end, NULL);
+        if (end.tv_sec - start.tv_sec >= 1) {
+            print_table(current_table, current_count);
+            current_count = 0;
+            start = end;
+        }
+    }
+    close(*readPort);
+}
+
+void forkRead(int argc, char *argv[], char *envp[]) {
+    pid_t cpid = fork();
+    Assert(cpid != -1, "fork failed");
+
+    if (cpid == 0) {
+        subProcessing(argc, argv, envp);
+    } else {
+        parentProcessing();
+        waitpid(cpid, NULL, 0);
+    }
+}
+
+void Init() {
+    readPort = &Pipe[0];
+    writePort = &Pipe[1];
+
+    if (pipe(Pipe) == -1) {
+        perror("pipe failed");
+        exit(EXIT_FAILURE);
+    }
+
+    devNull = open("/dev/null", O_WRONLY);
+    Assert(devNull != -1, "open /dev/null failed");
+
+    char *pathVar = getenv("PATH");
+    Assert(pathVar != NULL, "PATH environment variable not found");
+    strncpy(PATH, pathVar, sizeof(PATH) - 1);
+}
+
+int main(int argc, char *argv[], char *envp[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    Init();
+    forkRead(argc, argv, envp);
+    close(devNull);
+    return 0;
 }
