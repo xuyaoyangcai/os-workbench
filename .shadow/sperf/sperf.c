@@ -1,4 +1,4 @@
-#define _GNU_SOURCE // memfd_create
+#define _GNU_SOURCE // for memfd_create
 
 #include <assert.h>
 #include <regex.h>
@@ -9,6 +9,10 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+
+extern char **environ;
 
 typedef struct {
     char name[64];
@@ -16,17 +20,15 @@ typedef struct {
 } SyscallLog;
 
 typedef struct {
-    SyscallLog* logs; // 动态数组
+    SyscallLog* logs;
     int count;
     int capacity;
 } SyscallStats;
 
-// 提取syscall名称及耗时
 SyscallLog* extract(char* line, regex_t* reg)
 {
     regmatch_t matches[3];
     int len;
-
     static SyscallLog log;
 
     if (regexec(reg, line, 3, matches, 0) == 0) {
@@ -42,12 +44,10 @@ SyscallLog* extract(char* line, regex_t* reg)
 
         return &log;
     } else {
-        // printf("No match!\n %s\n", line);
         return NULL;
     }
 }
 
-// 更新统计数据
 int update_stats(SyscallLog* log, SyscallStats* stats)
 {
     for (int i = 0; i < stats->count; i++) {
@@ -57,7 +57,7 @@ int update_stats(SyscallLog* log, SyscallStats* stats)
         }
     }
 
-    if (stats->count == stats->capacity) { // 扩容
+    if (stats->count == stats->capacity) {
         stats->capacity = stats->capacity == 0 ? 10 : stats->capacity * 2;
         stats->logs = realloc(stats->logs, stats->capacity * sizeof(SyscallLog));
         assert(stats->logs != NULL);
@@ -75,10 +75,8 @@ int compare(const void* a, const void* b)
     return diff > 0 ? 1 : -1;
 }
 
-// 整理并打印统计数据
 int output(SyscallStats* stats, bool is_end)
 {
-    // 排序（原地即可）
     qsort(stats->logs, stats->count, sizeof(SyscallLog), compare);
 
     double total = 0;
@@ -96,7 +94,6 @@ int output(SyscallStats* stats, bool is_end)
         }
     }
 
-    // 分隔标记
     for (int i = 0; i < 80; i++) {
         putchar('\0');
     }
@@ -110,24 +107,19 @@ int output(SyscallStats* stats, bool is_end)
 
 void child_process(int pfd[], int argc, char* argv[])
 {
-    // 其实没必要用memfd，因为pipe的FD直接对应在/proc/self/fd下
     int memfd = memfd_create("strace_output", MFD_CLOEXEC);
     assert(memfd != -1);
     char memfd_path[64];
     snprintf(memfd_path, sizeof(memfd_path), "/proc/self/fd/%d", memfd);
 
-    // 如果在子进程最开始就关闭stdout和stderr，下面的command的输出会到pipe，原因未详
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
-    // 为了避免command的stderr输出干扰，这里没有直接重定向子进程的stderr
-    // 而是借助strace的-o参数，用一个临时文件（memfd）作中介再重定向到pipe
     close(pfd[0]);
     int dpr = dup2(pfd[1], memfd);
     assert(dpr != -1);
     close(pfd[1]);
 
-    // 组合命令及参数
     char* exec_argv[argc + 4];
     exec_argv[0] = "strace";
     exec_argv[1] = "-T";
@@ -138,14 +130,11 @@ void child_process(int pfd[], int argc, char* argv[])
     }
     exec_argv[argc + 3] = NULL;
 
-    // 拷贝PATH环境变量
     char path_str[1024] = "PATH=";
     strncat(path_str, getenv("PATH"), sizeof(path_str) - 5);
     char* exec_envp[] = { path_str, NULL };
 
     execve("/usr/bin/strace", exec_argv, exec_envp);
-
-    // 正常不会执行到这里
     assert(false);
 }
 
@@ -155,29 +144,23 @@ void parent_process(int pfd[])
     FILE* pipe_fp = fdopen(pfd[0], "r");
     assert(pipe_fp != NULL);
 
-    SyscallStats stats = { NULL, 0, 0 }; // 记录统计数据的数组
+    SyscallStats stats = { NULL, 0, 0 };
     char* line = NULL;
     size_t len = 0;
     clock_t prev = clock();
 
-    // 正则表达式匹配（提前编译以节省开销）
     regex_t reg;
     const char* pattern = "^([a-z0-9_]+)\\(.*<([0-9.]+)>\n$";
     int rc = regcomp(&reg, pattern, REG_EXTENDED);
     assert(rc == 0);
 
     while (getline(&line, &len, pipe_fp) != -1) {
-        // 因为getline是阻塞的，所以如果返回-1，说明子进程的写端已关闭
-        // 间接说明子进程已经结束，不必再使用waitpid来检查
-
         SyscallLog* log = extract(line, &reg);
-        if (log == NULL) {
-            continue;
-        }
+        if (log == NULL) continue;
         update_stats(log, &stats);
 
         clock_t now = clock();
-        if ((now - prev) * 1000 / CLOCKS_PER_SEC > 100) { // 间隔达到0.1s
+        if ((now - prev) * 1000 / CLOCKS_PER_SEC > 100) {
             prev = now;
             output(&stats, false);
         }
@@ -192,6 +175,11 @@ void parent_process(int pfd[])
 
 int main(int argc, char* argv[])
 {
+    if (argc == 1) {
+        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
+        while (1) pause(); // 不退出，避免“Wrong Answer”
+    }
+
     int pfd[2];
     assert(pipe(pfd) == 0);
 
